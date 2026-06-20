@@ -125,3 +125,9 @@ governance:
   tsk_ndjson: ""
   # Example:
   # tsk_ndjson: "C:/Users/techai/tsk-protocol/demo/analytics.ndjson"
+
+# Agent mesh node URLs.
+mesh:
+  army_url: "http://192.168.12.132:8500"   # AI Army on Spark-1
+  hub_url: "http://192.168.12.132:8765"    # Agent Hub on Spark-1
+  agentd_url: "http://localhost:8089"      # agent-status daemon (local)

@@ -28,6 +28,8 @@ from core.key_monitor import check_all_keys, refresh_provider
 from core.session_monitor import scan_sessions
 from core.memoryweb_monitor import get_status as mw_status
 from core.bpc_monitor import get_governance
+from core.cost_tracker import snapshot_costs, get_cost_history
+from core.mesh_monitor import get_mesh_status
 from daemon.monitor import daemon, alert_history
 from agents.ollama import get_agent
 from fixers.process_fixer import ProcessFixer
@@ -170,6 +172,57 @@ def api_governance():
     """BPC/TSK governance events and anomaly state."""
     force = request.args.get("refresh") == "1"
     return jsonify(get_governance(force=force))
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """Free-form chat with the configured LLM, with live system snapshot as context."""
+    data = request.get_json(force=True)
+    message = (data.get("message") or "").strip()
+    history = data.get("history", [])   # [{role, content}, ...]
+    if not message:
+        return jsonify({"error": "Empty message"}), 400
+
+    agent = get_agent()
+    if not agent.available():
+        return jsonify({"reply": "LLM not available. Set llm.provider in config.yaml (ollama / openai / anthropic)."})
+
+    # Build compact snapshot for system context
+    snap = daemon.latest() or {}
+    sys_info = snap.get("system", {})
+    gpus = sys_info.get("gpus", [])
+    issues = [i.get("title", "") for i in snap.get("issues", {}).get("active", []) if isinstance(i, dict)]
+    system_ctx = {
+        "cpu_pct": sys_info.get("cpu_pct"),
+        "ram_pct": sys_info.get("ram_pct"),
+        "gpus": [{"gpu_pct": g.get("gpu_pct"), "mem_pct": g.get("mem_pct"), "temp_c": g.get("temp_c")} for g in gpus],
+        "active_issues": issues[:5],
+        "storage": {k: {"free_gb": v.get("free_gb"), "failing": v.get("failing")}
+                    for k, v in snap.get("storage", {}).items()},
+    }
+
+    try:
+        reply = agent.chat(message, history=history, system_context=system_ctx)
+        return jsonify({"reply": reply})
+    except Exception as exc:
+        return jsonify({"reply": f"LLM error: {exc}"})
+
+
+@app.route("/api/cost-history")
+def api_cost_history():
+    """Return 30-day daily cost snapshots per provider. Pass ?refresh=1 to force a fresh MTD fetch."""
+    from core.cost_tracker import snapshot_costs, get_cost_history
+    force = request.args.get("refresh") == "1"
+    data = snapshot_costs() if force else get_cost_history()
+    return jsonify(data)
+
+
+@app.route("/api/mesh")
+def api_mesh():
+    """Agent Mesh status — Army OS, Hub, and local agent-status daemon."""
+    from core.mesh_monitor import get_mesh_status
+    force = request.args.get("refresh") == "1"
+    return jsonify(get_mesh_status(force=force))
 
 
 @app.route("/api/diagnose", methods=["POST"])
@@ -684,6 +737,34 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
 .gov-action{font-weight:600;margin-right:4px}
 .gov-pair{font-family:monospace;font-size:10px;color:var(--muted)}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.cost-provider-row{padding:4px 0}
+.cost-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px}
+.cost-label{font-size:12px;font-weight:600}
+.cost-mtd{font-size:13px;font-weight:700;color:var(--cyan)}
+.cost-spark{width:100%;height:40px;display:block;margin:4px 0 2px}
+.cost-range{font-size:10px;color:var(--muted)}
+
+/* ── Agent Mesh ──────────────────────────────────────────────────────────── */
+.mesh-health-line{font-size:11px;color:var(--muted);margin-bottom:10px}
+.mesh-node-row{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border)}
+.mesh-node-row:last-of-type{border-bottom:none}
+.mesh-node-left{display:flex;align-items:center;gap:10px}
+.mesh-node-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.mesh-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.mesh-dot-up{background:var(--green)}
+.mesh-dot-dn{background:var(--red);opacity:.7}
+.mesh-node-name{font-size:13px;font-weight:600}
+.mesh-node-sub{font-size:10px;color:var(--muted)}
+.mesh-node-cnt{font-size:12px;font-weight:500;color:var(--cyan)}
+.mesh-node-lat{font-size:10px;color:var(--muted)}
+.mesh-hub-line{font-size:10px;color:var(--muted);padding:2px 0 6px 19px}
+.mesh-agent-table-wrap{overflow-x:auto;margin-top:12px}
+.mesh-agent-table{width:100%;border-collapse:collapse;font-size:11px}
+.mesh-agent-table th{text-align:left;color:var(--muted);font-weight:500;padding:4px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+.mesh-agent-table td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.04)}
+.mesh-agent-table tr:last-child td{border-bottom:none}
+.mesh-st-online{color:var(--green);font-weight:600}
+.mesh-st-offline{color:var(--muted)}
 </style>
 </head>
 <body>
@@ -782,6 +863,25 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
     </div>
   </div>
 
+  <!-- Cost Tracker -->
+  <div class="card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Cost Tracker</span>
+      <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchCostHistory(true)">Update</button>
+    </div>
+    <div id="cost-panel"><div style="color:var(--muted);font-size:12px">Loading...</div></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:10px">MTD cost from admin keys. Snapshots stored daily in SQLite. Sparkline = last 14 days. Refreshes every 15 min.</div>
+  </div>
+
+  <!-- Agent Mesh panel — insert in .main after the MemoryWeb/BPC row -->
+  <div class="card" id="mesh-panel-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Agent Mesh</span>
+      <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchMesh(true)">Refresh</button>
+    </div>
+    <div id="mesh-panel"><div style="color:var(--muted);font-size:12px">Loading...</div></div>
+  </div>
+
   <!-- Bottom row -->
   <div class="grid-3">
     <div class="card">
@@ -805,6 +905,24 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
   </div>
 
 </div>
+
+<!-- Chat Drawer -->
+<div id="chat-drawer" style="position:fixed;bottom:0;right:24px;width:380px;z-index:300;display:none;flex-direction:column;border:1px solid var(--border);border-bottom:none;border-radius:10px 10px 0 0;background:var(--surface);box-shadow:0 -4px 24px rgba(0,0,0,.4)">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer" onclick="toggleChat()">
+    <span style="font-size:13px;font-weight:600">AI Chat <span style="font-size:10px;color:var(--muted);font-weight:400" id="chat-model-label"></span></span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn btn-neutral" style="font-size:10px;padding:2px 8px" onclick="event.stopPropagation();clearChat()">Clear</button>
+      <span style="color:var(--muted);font-size:16px" id="chat-chevron">▲</span>
+    </div>
+  </div>
+  <div id="chat-messages" style="flex:1;overflow-y:auto;max-height:340px;padding:10px 14px;display:flex;flex-direction:column;gap:8px"></div>
+  <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:8px">
+    <textarea id="chat-input" rows="2" placeholder="Ask anything about your system…" style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:12px;resize:none;font-family:inherit" onkeydown="chatKeydown(event)"></textarea>
+    <button class="btn btn-primary" style="align-self:flex-end;padding:7px 14px" onclick="sendChat()" id="chat-send-btn">Send</button>
+  </div>
+</div>
+<!-- Chat toggle button -->
+<button id="chat-fab" onclick="toggleChat()" style="position:fixed;bottom:20px;right:24px;z-index:299;background:var(--accent);color:#000;border:none;border-radius:50px;padding:10px 18px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.4)">AI Chat</button>
 
 <!-- Modal -->
 <div class="modal-backdrop" id="backdrop" onclick="bgClick(event)">
@@ -1258,6 +1376,273 @@ function fetchGovernance(force){
 }
 fetchGovernance(false);
 setInterval(()=>fetchGovernance(false), 30*1000);
+
+// ── Cost Tracker ─────────────────────────────────────────────────────────────
+const COST_COLORS = {
+  anthropic: '#06b6d4',
+  openai:    '#22c55e',
+  gemini:    '#eab308',
+  groq:      '#f97316',
+};
+const COST_LABELS = {
+  anthropic: 'Anthropic (Claude)',
+  openai:    'OpenAI (GPT)',
+  gemini:    'Google Gemini',
+  groq:      'Groq',
+};
+
+function costSparkline(points, color) {
+  const W = 200, H = 40, N = points.length;
+  if (N < 2) {
+    return `<svg viewBox="0 0 ${W} ${H}" class="cost-spark"><line x1="0" y1="${H/2}" x2="${W}" y2="${H/2}" stroke="${color}" stroke-width="1" stroke-dasharray="4 3" opacity="0.4"/></svg>`;
+  }
+  const mn = Math.min(...points), mx = Math.max(...points);
+  const range = mx - mn || 0.0001;
+  const pad = 3;
+  const pts = points.map((v, i) => {
+    const x = (i / (N - 1)) * W;
+    const y = H - pad - ((v - mn) / range) * (H - pad * 2);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const area = `0,${H} ${pts} ${W},${H}`;
+  return `<svg viewBox="0 0 ${W} ${H}" class="cost-spark" preserveAspectRatio="none">
+    <polygon points="${area}" style="fill:${color}22"/>
+    <polyline points="${pts}" style="fill:none;stroke:${color};stroke-width:1.5;stroke-linejoin:round"/>
+  </svg>`;
+}
+
+function renderCostHistory(data) {
+  const el = document.getElementById('cost-panel');
+  if (!data || !Object.keys(data).length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px">No cost data yet — requires ANTHROPIC_ADMIN_KEY or OPENAI_ADMIN_KEY.</div>';
+    return;
+  }
+  const providers = Object.keys(data).filter(k => data[k] && data[k].length > 0);
+  if (!providers.length) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px">No cost snapshots recorded yet.</div>';
+    return;
+  }
+  el.innerHTML = providers.map(pid => {
+    const series = data[pid];
+    // Last 14 entries for sparkline
+    const slice = series.slice(-14);
+    const vals = slice.map(r => r.cost_usd);
+    const mtd = vals.length ? vals[vals.length - 1] : 0;
+    const color = COST_COLORS[pid] || '#6366f1';
+    const label = COST_LABELS[pid] || pid;
+    const spark = costSparkline(vals, color);
+    const firstDate = slice.length ? slice[0].date : '';
+    const lastDate  = slice.length ? slice[slice.length - 1].date : '';
+    const rangeText = slice.length > 1 ? `${firstDate} → ${lastDate}` : lastDate;
+    return `<div class="cost-provider-row">
+      <div class="cost-header">
+        <span class="cost-label" style="color:${color}">${esc(label)}</span>
+        <span class="cost-mtd">$${mtd.toFixed(4)} MTD</span>
+      </div>
+      ${spark}
+      <div class="cost-range">${esc(rangeText)}</div>
+    </div>`;
+  }).join('<div class="sep" style="margin:8px 0"></div>');
+}
+
+function fetchCostHistory(force) {
+  const url = '/api/cost-history' + (force ? '?refresh=1' : '');
+  fetch(url).then(r => r.json()).then(renderCostHistory).catch(e => console.error(e));
+}
+fetchCostHistory(false);
+setInterval(() => fetchCostHistory(false), 15 * 60 * 1000);
+
+
+// ── Agent Mesh ────────────────────────────────────────────────────────────────
+function renderMesh(data) {
+  const el = document.getElementById('mesh-panel');
+  if (!el) return;
+  if (!data) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px">Loading...</div>';
+    return;
+  }
+
+  const army   = data.army   || {};
+  const hub    = data.hub    || {};
+  const agentd = data.agentd || {};
+
+  // Node row builder
+  function nodeRow(node, label, sublabel) {
+    const up   = node.reachable;
+    const dot  = up
+      ? '<span class="mesh-dot mesh-dot-up"></span>'
+      : '<span class="mesh-dot mesh-dot-dn"></span>';
+    const lat  = node.latency_ms != null ? node.latency_ms + 'ms' : '—';
+    const cnt  = node.agents_online != null
+      ? node.agents_online + ' / ' + (node.agent_count || '?') + ' agents'
+      : node.agent_count != null
+        ? node.agent_count + ' agents'
+        : (up ? '—' : (node.start_hint
+            ? '<span style="color:var(--muted);font-size:10px" title="' + esc(node.start_hint) + '">not running</span>'
+            : 'unreachable'));
+    return `<div class="mesh-node-row">
+      <div class="mesh-node-left">
+        ${dot}
+        <div>
+          <div class="mesh-node-name">${esc(label)}</div>
+          <div class="mesh-node-sub">${esc(sublabel)}</div>
+        </div>
+      </div>
+      <div class="mesh-node-right">
+        <div class="mesh-node-cnt">${cnt}</div>
+        <div class="mesh-node-lat">${up ? lat : ''}</div>
+      </div>
+    </div>`;
+  }
+
+  // Army agent detail rows
+  let agentDetail = '';
+  const agents = army.api_data;
+  if (Array.isArray(agents) && agents.length) {
+    agentDetail = '<div class="mesh-agent-table-wrap"><table class="mesh-agent-table">'
+      + '<thead><tr>'
+      + '<th>Agent</th><th>Machine</th><th>Status</th>'
+      + '<th>Done</th><th>Fail</th><th>Tokens</th><th>Cost</th>'
+      + '</tr></thead><tbody>'
+      + agents.map(a => {
+          const st    = a.status || '?';
+          const stCls = st === 'online' ? 'mesh-st-online' : 'mesh-st-offline';
+          const cost  = a.total_cost_usd != null ? '$' + (+a.total_cost_usd).toFixed(4) : '—';
+          const tok   = a.total_tokens != null ? (+a.total_tokens).toLocaleString() : '—';
+          const hb    = a.last_heartbeat
+            ? (() => {
+                try {
+                  const d = (Date.now() / 1000) - new Date(a.last_heartbeat).getTime() / 1000;
+                  return d < 120 ? 'just now' : d < 3600 ? Math.round(d / 60) + 'm ago' : Math.round(d / 3600) + 'h ago';
+                } catch(e) { return a.last_heartbeat; }
+              })()
+            : '—';
+          return `<tr title="Last heartbeat: ${esc(hb)}">
+            <td>${esc(a.role || a.id || '?')}</td>
+            <td>${esc(a.machine || '—')}</td>
+            <td><span class="${stCls}">${esc(st)}</span></td>
+            <td>${a.tasks_completed != null ? a.tasks_completed : '—'}</td>
+            <td>${a.tasks_failed    != null ? a.tasks_failed    : '—'}</td>
+            <td>${tok}</td>
+            <td>${cost}</td>
+          </tr>`;
+        }).join('')
+      + '</tbody></table></div>';
+  }
+
+  // Hub conversations badge
+  let hubExtra = '';
+  if (hub.reachable) {
+    const ca = hub.conversations_active != null ? hub.conversations_active : '?';
+    const ct = hub.conversations_total  != null ? hub.conversations_total  : '?';
+    const dead = hub.dead_agent_count != null ? ` &bull; ${hub.dead_agent_count} stale` : '';
+    hubExtra = `<div class="mesh-hub-line">${ca} active convs / ${ct} total${dead}</div>`;
+  }
+
+  const healthDot = data.mesh_healthy
+    ? '<span style="color:var(--green)">&#9679;</span> Healthy'
+    : '<span style="color:var(--red)">&#9679;</span> Degraded';
+
+  el.innerHTML = `
+    <div class="mesh-health-line">${healthDot} &bull; checked ${esc(data.checked_at || '—')}</div>
+    ${nodeRow(army,   'AI Army OS',     'Spark-1 · 192.168.12.132:8500 · GB10 119.7 GB')}
+    ${nodeRow(hub,    'Army Hub',       'Spark-1 · 192.168.12.132:8765')}
+    ${hubExtra}
+    ${nodeRow(agentd, 'Agent-Status',   'localhost:8089 · Windows PC · RTX 5090')}
+    ${agentDetail}
+  `;
+}
+
+function fetchMesh(force) {
+  const url = '/api/mesh' + (force ? '?refresh=1' : '');
+  fetch(url)
+    .then(r => r.json())
+    .then(renderMesh)
+    .catch(e => console.error('mesh fetch error', e));
+}
+
+// Startup + 15 s interval
+fetchMesh(false);
+setInterval(() => fetchMesh(false), 15 * 1000);
+
+
+// ── AI Chat ───────────────────────────────────────────────────────────────────
+let _chatHistory = [];
+let _chatOpen = false;
+let _chatBusy = false;
+
+function toggleChat(){
+  _chatOpen = !_chatOpen;
+  const drawer = document.getElementById('chat-drawer');
+  const fab = document.getElementById('chat-fab');
+  const chevron = document.getElementById('chat-chevron');
+  drawer.style.display = _chatOpen ? 'flex' : 'none';
+  fab.style.display = _chatOpen ? 'none' : '';
+  chevron.textContent = _chatOpen ? '▼' : '▲';
+  if(_chatOpen) document.getElementById('chat-input').focus();
+}
+
+function clearChat(){
+  _chatHistory = [];
+  document.getElementById('chat-messages').innerHTML = '';
+}
+
+function chatKeydown(e){
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChat(); }
+}
+
+function _appendMsg(role, text){
+  const el = document.createElement('div');
+  el.style.cssText = role==='user'
+    ? 'align-self:flex-end;background:var(--accent);color:#000;padding:7px 11px;border-radius:10px 10px 2px 10px;font-size:12px;max-width:85%;white-space:pre-wrap'
+    : 'align-self:flex-start;background:var(--surface2);color:var(--text);padding:7px 11px;border-radius:10px 10px 10px 2px;font-size:12px;max-width:90%;white-space:pre-wrap;border:1px solid var(--border)';
+  el.textContent = text;
+  const msgs = document.getElementById('chat-messages');
+  msgs.appendChild(el);
+  msgs.scrollTop = msgs.scrollHeight;
+  return el;
+}
+
+function sendChat(){
+  if(_chatBusy) return;
+  const inp = document.getElementById('chat-input');
+  const msg = inp.value.trim();
+  if(!msg) return;
+  inp.value = '';
+  _chatBusy = true;
+  document.getElementById('chat-send-btn').disabled = true;
+
+  _appendMsg('user', msg);
+  const thinking = _appendMsg('assistant', '…');
+
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({message: msg, history: _chatHistory})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    const reply = d.reply || d.error || '(no response)';
+    thinking.textContent = reply;
+    _chatHistory.push({role:'user', content:msg});
+    _chatHistory.push({role:'assistant', content:reply});
+    // Keep last 20 turns
+    if(_chatHistory.length > 20) _chatHistory = _chatHistory.slice(-20);
+  })
+  .catch(e=>{ thinking.textContent = 'Error: '+e; })
+  .finally(()=>{
+    _chatBusy = false;
+    document.getElementById('chat-send-btn').disabled = false;
+  });
+}
+
+// Show model label in chat header once status loads
+function _setChatModelLabel(snap){
+  const lbl = document.getElementById('chat-model-label');
+  if(lbl && snap && snap.system) {
+    fetch('/api/status').then(()=>{}).catch(()=>{});
+  }
+}
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 function fetchStatus(){

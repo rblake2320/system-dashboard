@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS action_log (
     result  TEXT,
     success INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS cost_snapshots (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider   TEXT    NOT NULL,
+    date       TEXT    NOT NULL,
+    cost_usd   REAL    NOT NULL,
+    sampled_at INTEGER NOT NULL,
+    UNIQUE(provider, date) ON CONFLICT REPLACE
+);
+CREATE INDEX IF NOT EXISTS idx_cs_provider_date ON cost_snapshots(provider, date DESC);
 """
 
 _VACUUM_INTERVAL = 86_400          # run vacuum check at most once per day

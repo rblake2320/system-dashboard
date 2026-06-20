@@ -1,4 +1,4 @@
-"""Ollama LLM agent — uses a local model to diagnose issues."""
+"""Ollama LLM agent — uses a local model to diagnose issues and chat."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 
 from core import config as cfg
-from .base import AgentBase, DiagnosisResult
+from .base import AgentBase, DiagnosisResult, _CHAT_SYSTEM
 
 _SYSTEM_PROMPT = """\
 You are a system reliability engineer analyzing a live workstation dashboard.
@@ -80,6 +80,36 @@ class OllamaAgent(AgentBase):
             confidence=parsed.get("confidence", "medium"),
             raw=raw_text,
         )
+
+
+    def chat(self, message: str, history: list[dict], system_context: dict) -> str:
+        """Multi-turn chat via Ollama /api/chat endpoint."""
+        ctx_str = json.dumps(system_context, default=str)[:800]
+        system_msg = f"{_CHAT_SYSTEM}\n\nCurrent system snapshot:\n{ctx_str}"
+
+        messages = [{"role": "system", "content": system_msg}]
+        # Append prior history (cap at last 10 turns to stay within context)
+        for turn in history[-10:]:
+            role = turn.get("role", "user")
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": turn.get("content", "")})
+        messages.append({"role": "user", "content": message})
+
+        payload = json.dumps({
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.3, "num_predict": 1024},
+        }).encode()
+        req = urllib.request.Request(
+            f"{self._host}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            raw = json.loads(resp.read())
+        return raw.get("message", {}).get("content", "No response")
 
 
 class OpenAIAgent(AgentBase):
@@ -160,6 +190,55 @@ class OpenAIAgent(AgentBase):
             confidence=parsed.get("confidence", "medium"),
             raw=raw_text,
         )
+
+
+    def chat(self, message: str, history: list[dict], system_context: dict) -> str:
+        """Multi-turn chat via OpenAI/Anthropic chat completions."""
+        ctx_str = json.dumps(system_context, default=str)[:800]
+        system_msg = f"{_CHAT_SYSTEM}\n\nCurrent system snapshot:\n{ctx_str}"
+
+        messages_out = []
+        if self._provider != "anthropic":
+            messages_out.append({"role": "system", "content": system_msg})
+        for turn in history[-10:]:
+            role = turn.get("role", "user")
+            if role in ("user", "assistant"):
+                messages_out.append({"role": role, "content": turn.get("content", "")})
+        messages_out.append({"role": "user", "content": message})
+
+        if self._provider == "anthropic":
+            payload = json.dumps({
+                "model": self._model,
+                "max_tokens": 1024,
+                "system": system_msg,
+                "messages": [m for m in messages_out if m["role"] != "system"],
+            }).encode()
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": self._api_key,
+                "anthropic-version": "2023-06-01",
+            }
+        else:
+            payload = json.dumps({
+                "model": self._model,
+                "messages": messages_out,
+                "max_tokens": 1024,
+                "temperature": 0.3,
+            }).encode()
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._api_key}",
+            }
+
+        req = urllib.request.Request(
+            self._endpoint, data=payload, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            raw = json.loads(resp.read())
+
+        if self._provider == "anthropic":
+            return raw["content"][0]["text"]
+        return raw["choices"][0]["message"]["content"]
 
 
 def get_agent() -> AgentBase:
