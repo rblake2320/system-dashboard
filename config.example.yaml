@@ -1,0 +1,83 @@
+# system-dashboard — example config
+# Copy to config.yaml and customize. config.yaml is gitignored.
+
+dashboard:
+  port: 8099
+  host: "127.0.0.1"
+  refresh_interval_seconds: 10   # how often the browser polls
+
+daemon:
+  enabled: true
+  interval_seconds: 30           # how often background scan runs
+
+llm:
+  provider: "ollama"             # ollama | openai | anthropic | none
+  model: "gemma3:latest"         # model name for your provider
+  host: "http://localhost:11434" # ollama only
+  api_key: ""                    # openai / anthropic — or set env OPENAI_API_KEY
+  timeout_seconds: 60
+
+# Processes to track. Add any exe name you care about.
+processes:
+  tracked:
+    - name: "claude.exe"
+      label: "Claude Code"
+      warn_if_count_exceeds: 6
+    - name: "codex.exe"
+      label: "Codex (OpenAI)"
+      warn: true
+      warn_reason: "Runs autonomously without approval"
+    - name: "node.exe"
+      label: "Node / MCP Servers"
+    - name: "python.exe"
+      label: "Python"
+    - name: "pwsh.exe"
+      label: "PowerShell"
+    - name: "cmd.exe"
+      label: "CMD"
+    - name: "bash.exe"
+      label: "Bash"
+    # Add any exe you want to track:
+    # - name: "my-daemon.exe"
+    #   label: "My Daemon"
+    #   warn_if_count_exceeds: 1
+
+# Ports to monitor. Add any you care about.
+services:
+  ports:
+    8099: "This Dashboard"
+    8100: "MemoryWeb API"
+    5432: "PostgreSQL"
+    5433: "PostgreSQL (alt)"
+    6379: "Redis"
+    4222: "NATS"
+    8080: "HTTP alt"
+    3000: "Dev server"
+    3001: "Dev server / Playwright"
+    11434: "Ollama"
+    # Add more:
+    # 8888: "JupyterLab"
+    # 9090: "Prometheus"
+
+# Storage: which drives/paths to show.
+storage:
+  drives: ["C", "D"]             # Windows drive letters
+  warn_free_gb_below: 10.0       # warn when free space < this
+  failing_drives: []             # drives flagged as hardware-failing, e.g. ["D"]
+
+# Projects to track on the Projects tab.
+# path supports ~ for home directory.
+projects: []
+# Example:
+# projects:
+#   - name: "My App"
+#     path: "~/my-app"
+#   - name: "API Server"
+#     path: "~/projects/api"
+
+# External IPs to name in the Network panel.
+known_ips: {}
+# Example:
+# known_ips:
+#   "192.168.1.50": "Home NAS"
+#   "10.0.0.2": "GPU Server"
