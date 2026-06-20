@@ -15,9 +15,15 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import datetime
+
 from flask import Flask, Response, jsonify, request, stream_with_context
 
 from core import config as cfg, collector, issues as issue_mod
+from core.persistence import db
+from core.auth import require_token, generate_token, print_startup_token
+from core.audit import log_action
+from core.pid_guard import pid_guard
 from daemon.monitor import daemon, alert_history
 from agents.ollama import get_agent
 from fixers.process_fixer import ProcessFixer
@@ -53,8 +59,24 @@ def api_status():
         issue_mod.registry.update(detected)
         snap["issues"] = [i.as_dict() for i in issue_mod.registry.get_active()]
         snap["alert_history"] = alert_history.get(50)
-        snap["history"] = {}
         snap["disk_io"] = {}
+        # Load sparkline history from DB when in-memory rolling is empty
+        snap["history"] = {}
+        for metric in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
+            rows = db.get_metric_history(metric, limit=60)
+            if rows:
+                rows.reverse()  # oldest first for sparklines
+                snap["history"][metric] = [r["value"] for r in rows]
+    elif not snap.get("history"):
+        # Daemon is live but history dict is somehow empty — fill from DB
+        snap["history"] = {}
+        for metric in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
+            rows = db.get_metric_history(metric, limit=60)
+            if rows:
+                rows.reverse()
+                snap["history"][metric] = [r["value"] for r in rows]
+    snap["daemon_alive"] = not daemon.is_stale
+    snap["last_tick_ts"] = daemon._last_tick_ts
     return jsonify(snap)
 
 
@@ -63,17 +85,63 @@ def api_issues():
     return jsonify([i.as_dict() for i in issue_mod.registry.get_active()])
 
 
+@app.route("/api/issues/<issue_id>/acknowledge", methods=["POST"])
+def api_acknowledge(issue_id: str):
+    issue = issue_mod.registry.get(issue_id)
+    if not issue:
+        return jsonify({"error": "Issue not found"}), 404
+    issue_mod.registry.acknowledge(issue_id)
+    return jsonify({"ok": True, "state": "acknowledged"})
+
+
+@app.route("/api/issues/<issue_id>/suppress", methods=["POST"])
+def api_suppress(issue_id: str):
+    issue = issue_mod.registry.get(issue_id)
+    if not issue:
+        return jsonify({"error": "Issue not found"}), 404
+    data = request.get_json(force=True) or {}
+    minutes = data.get("until_minutes", 60)
+    until_ts = time.time() + float(minutes) * 60
+    issue_mod.registry.suppress(issue_id, until_ts=until_ts)
+    return jsonify({"ok": True, "state": "suppressed", "until_ts": until_ts})
+
+
 @app.route("/api/alert_history")
 def api_alert_history():
-    return jsonify(alert_history.get(100))
+    # Merge in-memory (newest events, may include current session) with DB (survives restarts)
+    mem_alerts = alert_history.get(100)
+    mem_ids = {a["id"] for a in mem_alerts}
+    db_alerts = db.get_alerts(limit=100)
+    # Convert DB rows to the same shape as in-memory alerts
+    for row in db_alerts:
+        if row["issue_id"] not in mem_ids:
+            mem_alerts.append({
+                "id": row["issue_id"],
+                "severity": row["severity"],
+                "title": row["title"],
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["ts"])),
+                "ts_epoch": row["ts"],
+            })
+    # Sort combined list newest-first and cap at 100
+    mem_alerts.sort(key=lambda x: x.get("ts_epoch", 0), reverse=True)
+    return jsonify(mem_alerts[:100])
+
+
+@app.route("/api/actions")
+def api_actions():
+    return jsonify(db.get_actions(limit=100))
 
 
 @app.route("/api/diagnose", methods=["POST"])
 def api_diagnose():
+    if not require_token(request):
+        log_action("diagnose", {}, request.remote_addr or "", "rejected: missing token")
+        return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json(force=True)
     issue_id = data.get("issue_id", "")
     issue = issue_mod.registry.get(issue_id)
     if not issue:
+        log_action("diagnose", {"issue_id": issue_id}, request.remote_addr or "", "issue not found")
         return jsonify({"error": "Issue not found"}), 404
     agent = get_agent()
     if not agent.available():
@@ -84,14 +152,10 @@ def api_diagnose():
             "confidence": "low",
         })
     snap = daemon.latest() or {}
-    context = {
-        "system": snap.get("system", {}),
-        "processes": {k: {"count": v["count"], "total_mb": v["total_mb"]}
-                      for k, v in snap.get("processes", {}).items()},
-        "ports": {k: {"up": v["up"]} for k, v in snap.get("ports", {}).items()},
-    }
+    context = _build_filtered_context(snap, issue)
     try:
         result = agent.diagnose(issue.as_dict(), context)
+        log_action("diagnose", {"issue_id": issue_id}, request.remote_addr or "", "ok")
         return jsonify({
             "summary": result.summary,
             "root_cause": result.root_cause,
@@ -106,6 +170,12 @@ def api_diagnose():
 
 @app.route("/api/fix/stream")
 def api_fix_stream():
+    if not require_token(request):
+        log_action("fix_stream", {}, request.remote_addr or "", "rejected: missing token")
+        def _unauth():
+            yield "data: Unauthorized\n\n"
+            yield "data: FAILED\n\n"
+        return Response(stream_with_context(_unauth()), mimetype="text/event-stream", status=401)
     issue_id = request.args.get("issue_id", "")
     issue = issue_mod.registry.get(issue_id)
     if not issue:
@@ -141,16 +211,218 @@ def api_fix_stream():
     )
 
 
+def _build_filtered_context(snap: dict, issue: "issue_mod.Issue") -> dict:
+    """Build a compact LLM context dict — max 2000 chars to avoid token exhaustion."""
+    sys = snap.get("system", {})
+    gpus = sys.get("gpus", [])
+
+    # System: only key percentages
+    context: dict = {
+        "system": {
+            "cpu_pct": sys.get("cpu_pct"),
+            "ram_pct": sys.get("ram_pct"),
+            "gpus": [{"index": g.get("index"), "gpu_pct": g.get("gpu_pct"), "mem_pct": g.get("mem_pct")} for g in gpus],
+        },
+    }
+
+    # Processes: the specific process matching the issue + top 5 by memory
+    raw_procs = snap.get("processes", {})
+    issue_name = (issue.context or {}).get("name", "")
+    top5 = sorted(
+        [{"name": k, "count": v["count"], "total_mb": v["total_mb"]} for k, v in raw_procs.items()],
+        key=lambda x: x["total_mb"], reverse=True,
+    )[:5]
+    matched = None
+    if issue_name:
+        matched_data = raw_procs.get(issue_name)
+        if matched_data:
+            matched = {"name": issue_name, "count": matched_data["count"], "total_mb": matched_data["total_mb"]}
+    context["processes"] = {"top5_by_memory": top5}
+    if matched:
+        context["processes"]["issue_process"] = matched
+
+    # Ports: only downed services
+    raw_ports = snap.get("ports", {})
+    context["ports_down"] = {k: v.get("label", k) for k, v in raw_ports.items() if not v.get("up")}
+
+    # Issue's own context (already specific)
+    if issue.context:
+        context["issue_context"] = issue.context
+
+    # Truncate to 2000 chars
+    serialized = json.dumps(context, default=str)
+    if len(serialized) > 2000:
+        serialized = serialized[:1997] + "..."
+        # Return a truncated string wrapped so the agent can still decode context
+        context = {"_truncated": True, "raw": serialized}
+
+    return context
+
+
+def _compute_health_score(issues: list) -> int:
+    """100 minus 20 per critical, 5 per warning."""
+    score = 100
+    for iss in issues:
+        sev = iss.get("severity") if isinstance(iss, dict) else getattr(iss, "severity", "")
+        if sev == "critical":
+            score -= 20
+        elif sev == "warning":
+            score -= 5
+    return max(0, score)
+
+
+@app.route("/api/review")
+def api_review():
+    """Full system review — fresh snapshot + AI diagnoses on every active issue."""
+    with_ai = request.args.get("with_ai", "true").lower() not in ("false", "0", "no")
+
+    # 1. Force fresh snapshot (bypass daemon cache)
+    snap = collector.build_snapshot()
+    detected = issue_mod.detect_issues(snap)
+    issue_mod.registry.update(detected)
+
+    sys = snap.get("system", {})
+    gpus = sys.get("gpus", [])
+    raw_ports = snap.get("ports", {})
+    ports_up = sum(1 for v in raw_ports.values() if v.get("up"))
+
+    drives = sys.get("drives", {})
+    drives_summary = {
+        lt: {"free_gb": d.get("free_gb"), "pct": d.get("pct"), "failing": d.get("failing", False)}
+        for lt, d in drives.items()
+    }
+
+    snapshot_summary = {
+        "cpu_pct": sys.get("cpu_pct"),
+        "ram_pct": sys.get("ram_pct"),
+        "gpu_pct": gpus[0].get("gpu_pct") if gpus else None,
+        "drives_summary": drives_summary,
+        "ports_up_count": ports_up,
+    }
+
+    # 2. Build issues list — optionally run AI diagnoses
+    active_issues = issue_mod.registry.get_active()
+    agent = get_agent() if with_ai else None
+    issues_out = []
+    for iss in active_issues:
+        iss_dict = iss.as_dict()
+        if with_ai and agent and agent.available():
+            try:
+                context = _build_filtered_context(snap, iss)
+                result = agent.diagnose(iss_dict, context)
+                iss_dict["diagnosis"] = {
+                    "summary": result.summary,
+                    "root_cause": result.root_cause,
+                    "suggested_fix": result.suggested_fix,
+                    "fixer_id": result.fixer_id,
+                    "fix_params": result.fix_params,
+                    "confidence": result.confidence,
+                }
+            except Exception as exc:
+                iss_dict["diagnosis"] = {"error": str(exc)}
+            time.sleep(2)  # throttle — max 1 LLM call per 2s to avoid overloading Ollama
+        issues_out.append(iss_dict)
+
+    # 3. Top processes by memory and CPU
+    raw_procs = snap.get("processes", {})
+    all_procs_flat: list[dict] = []
+    for name, pdata in raw_procs.items():
+        for p in pdata.get("procs", []):
+            all_procs_flat.append({
+                "name": name,
+                "pid": p.get("pid"),
+                "mem_mb": p.get("mem_mb", 0),
+                "cpu_pct": p.get("cpu_pct", 0),
+                "status": p.get("status"),
+            })
+
+    top_by_mem = sorted(all_procs_flat, key=lambda x: x["mem_mb"], reverse=True)[:5]
+    top_by_cpu = sorted(all_procs_flat, key=lambda x: x["cpu_pct"], reverse=True)[:5]
+
+    return jsonify({
+        "ts": snap.get("ts"),
+        "snapshot_summary": snapshot_summary,
+        "issues": issues_out,
+        "top_processes_by_memory": top_by_mem,
+        "top_processes_by_cpu": top_by_cpu,
+        "health_score": _compute_health_score(issues_out),
+    })
+
+
+@app.route("/api/export")
+def api_export():
+    """Download a JSON bundle of the current system state and issue history."""
+    snap = daemon.latest() or collector.build_snapshot()
+    active_issues = issue_mod.registry.get_active()
+    issues_list = [i.as_dict() for i in active_issues]
+
+    bundle = {
+        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "dashboard_version": "2.0.0",
+        "system": snap,
+        "issues": issues_list,
+        "alert_history": alert_history.get(50),
+        "health_score": _compute_health_score(issues_list),
+    }
+
+    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"system-review-{date_str}.json"
+
+    return Response(
+        json.dumps(bundle, indent=2, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.route("/api/kill_pid", methods=["POST"])
 def api_kill_pid():
+    if not require_token(request):
+        log_action("kill_pid", {}, request.remote_addr or "", "rejected: missing token")
+        return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json(force=True)
     pid = data.get("pid")
     if not pid:
         return jsonify({"error": "pid required"}), 400
+    try:
+        pid = int(pid)
+    except (ValueError, TypeError):
+        return jsonify({"error": "pid must be an integer"}), 400
+    snap = daemon.latest() or {}
+    ok, reason = pid_guard.validate_kill(pid, snap)
+    log_action(
+        "kill_pid",
+        {"pid": pid},
+        request.remote_addr or "",
+        f"{"allowed" if ok else "blocked"}: {reason}",
+        pid_validated=ok,
+    )
+    if not ok:
+        return jsonify({"error": f"Kill blocked: {reason}"}), 403
     fixer = ProcessFixer()
     lines = list(fixer.fix({"fixer_id": "process_fixer", "fix_params": {"action": "kill_by_pid", "pid": pid}}))
     success = any("DONE" in l for l in lines)
     return jsonify({"output": lines, "success": success})
+
+
+
+
+# ── Security utility routes ────────────────────────────────────────────────────
+
+@app.route("/api/token")
+def api_token():
+    """Return the session token — only accessible from localhost."""
+    remote = request.remote_addr or ""
+    if not (remote.startswith("127.") or remote == "::1"):
+        return jsonify({"error": "Forbidden: localhost only"}), 403
+    return jsonify({"token": generate_token()})
+
+
+@app.route("/api/audit")
+def api_audit():
+    """Return the last 100 audit log entries."""
+    from core.audit import audit_log
+    return jsonify(audit_log.tail(100))
 
 
 # ── HTML ────────────────────────────────────────────────────────────────────────
@@ -176,6 +448,8 @@ a{color:inherit;text-decoration:none}
 .topbar h1{font-size:17px;font-weight:600;letter-spacing:.3px}
 .topbar .meta{display:flex;gap:16px;align-items:center;font-size:12px;color:var(--muted)}
 .dot-live{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+.dot-stale{width:8px;height:8px;border-radius:50%;background:var(--red);animation:pulse 2s infinite}
+.stale-banner{display:none;background:rgba(239,68,68,.15);border:1px solid var(--red);border-radius:6px;padding:4px 12px;font-size:12px;font-weight:600;color:var(--red);animation:pulse 1.5s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .main{padding:16px 20px;display:flex;flex-direction:column;gap:16px}
 
@@ -210,6 +484,14 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
 .btn-fix{background:var(--green);color:#000}
 .btn-danger{background:var(--red);color:#fff}
 .btn-neutral{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
+.btn-ack{background:rgba(234,179,8,.2);color:var(--yellow);border:1px solid var(--yellow)}
+.btn-suppress{background:rgba(107,114,128,.15);color:var(--muted);border:1px solid var(--border)}
+.state-badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;margin-left:4px}
+.state-new{background:rgba(59,130,246,.15);color:var(--blue)}
+.state-active{background:rgba(239,68,68,.15);color:var(--red)}
+.state-acknowledged{background:rgba(234,179,8,.15);color:var(--yellow)}
+.state-fixing{background:rgba(6,182,212,.15);color:var(--cyan)}
+.state-suppressed{background:rgba(107,114,128,.15);color:var(--muted)}
 .badge{display:inline-block;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600}
 .badge-critical{background:rgba(239,68,68,.2);color:var(--red)}
 .badge-warning{background:rgba(234,179,8,.2);color:var(--yellow)}
@@ -284,7 +566,8 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
 <div class="topbar">
   <h1>System Dashboard</h1>
   <div class="meta">
-    <span class="dot-live"></span>
+    <span class="dot-live" id="live-dot"></span>
+    <div class="stale-banner" id="stale-banner">STALE — daemon stopped</div>
     <span id="ts">Loading...</span>
     <span>|</span>
     <span>Refresh in <span id="countdown">10</span>s</span>
@@ -592,15 +875,19 @@ function renderIssues(snap){
   document.getElementById('issue-count').textContent=issues.length;
   document.getElementById('issues-list').innerHTML=issues.map(iss=>{
     const hasFixer=!!iss.fixer_id;
+    const state=iss.state||'active';
     return`<div class="issue-card ${iss.severity}">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
         <span class="badge badge-${iss.severity}">${iss.severity.toUpperCase()}</span>
         <div class="issue-title">${esc(iss.title)}</div>
+        <span class="state-badge state-${state}">${state}</span>
       </div>
       <div class="issue-desc">${esc(iss.description)}</div>
       <div class="issue-actions">
         <button class="btn btn-diagnose" onclick="diagnose('${iss.id}','${sesc(iss.title)}')">&#x1F4AC; Diagnose with AI</button>
         ${hasFixer?`<button class="btn btn-fix" onclick="runFix('${iss.id}','${iss.fixer_id}','${sesc(iss.title)}')">&#x26A1; Auto-Fix</button>`:''}
+        <button class="btn btn-ack" onclick="ackIssue('${iss.id}')">&#x2713; Ack</button>
+        <button class="btn btn-suppress" onclick="suppressIssue('${iss.id}')">Snooze 1h</button>
       </div>
     </div>`;
   }).join('');
@@ -635,6 +922,10 @@ function renderHooks(snap){
 // ── Full render ──────────────────────────────────────────────────────────────
 function render(snap){
   document.getElementById('ts').textContent=snap.ts_display||'';
+  const alive=snap.daemon_alive!==false;
+  document.getElementById('live-dot').style.display=alive?'':' none';
+  document.getElementById('stale-banner').style.display=alive?'none':'';
+  document.getElementById('live-dot').className=alive?'dot-live':'dot-stale';
   renderSys(snap);
   renderStorage(snap);
   renderProcs(snap);
@@ -656,6 +947,18 @@ setInterval(()=>{
   countdown--;if(countdown<0)countdown=REFRESH_S;
   document.getElementById('countdown').textContent=countdown;
 },1000);
+
+// ── Acknowledge / Suppress ───────────────────────────────────────────────────
+function ackIssue(id){
+  fetch('/api/issues/'+encodeURIComponent(id)+'/acknowledge',{method:'POST'})
+    .then(r=>r.json()).then(()=>fetchStatus()).catch(e=>console.error(e));
+}
+function suppressIssue(id){
+  fetch('/api/issues/'+encodeURIComponent(id)+'/suppress',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({until_minutes:60})
+  }).then(r=>r.json()).then(()=>fetchStatus()).catch(e=>console.error(e));
+}
 
 // ── Kill PID ─────────────────────────────────────────────────────────────────
 function killPid(pid,name){
@@ -740,5 +1043,6 @@ if __name__ == "__main__":
     host = dcfg.get("host", "127.0.0.1")
 
     _start_daemon()
+    print_startup_token()
     print(f"System Dashboard -> http://{host}:{port}")
     app.run(host=host, port=port, debug=False, threaded=True)

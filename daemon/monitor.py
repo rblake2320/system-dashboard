@@ -9,6 +9,7 @@ from typing import Any
 import psutil
 
 from core import collector, issues as issue_mod, config as cfg
+from core.persistence import db
 
 
 # ── Per-process CPU sampler ───────────────────────────────────────────────────
@@ -147,6 +148,12 @@ class MonitorDaemon:
         self._cpu_sampler = _ProcCPUSampler()
         self._disk_io = _DiskIOTracker()
         self._service_first_seen: dict[str, float] = {}  # port → first seen up ts
+        self._last_tick_ts: float = 0.0
+
+    @property
+    def is_stale(self) -> bool:
+        """True if the daemon has not completed a tick in the last 90 seconds."""
+        return time.time() - self._last_tick_ts > 90
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -164,6 +171,13 @@ class MonitorDaemon:
 
     def _run(self) -> None:
         interval = cfg.daemon().get("interval_seconds", 30)
+        # Seed rolling history from DB (last 60 points per metric, oldest first)
+        for metric_key in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
+            rows = db.get_metric_history(metric_key, limit=60)
+            rows.reverse()  # get_metric_history returns newest-first; push oldest first
+            for row in rows:
+                rolling.push(metric_key, row["value"])
+
         # Prime CPU sampler
         tracked_names = {t["name"].lower() for t in cfg.processes()}
         self._cpu_sampler.sample(tracked_names)
@@ -200,13 +214,22 @@ class MonitorDaemon:
                 self._service_first_seen.pop(key, None)
                 pdata["uptime_s"] = None
 
-        # Rolling history
+        # Rolling history + DB persistence
         sys = snap["system"]
-        rolling.push("cpu_pct", sys["cpu_pct"])
-        rolling.push("ram_pct", sys["ram_pct"])
+        ts_now = int(now)
+        for metric, value in (
+            ("cpu_pct", sys["cpu_pct"]),
+            ("ram_pct", sys["ram_pct"]),
+        ):
+            rolling.push(metric, value)
+            db.push_metric(metric, value, ts_now)
         for gpu in sys.get("gpus", []):
-            rolling.push(f"gpu{gpu['index']}_pct", gpu["gpu_pct"])
-            rolling.push(f"gpu{gpu['index']}_mem_pct", gpu["mem_pct"])
+            for metric, value in (
+                (f"gpu{gpu['index']}_pct", gpu["gpu_pct"]),
+                (f"gpu{gpu['index']}_mem_pct", gpu["mem_pct"]),
+            ):
+                rolling.push(metric, value)
+                db.push_metric(metric, value, ts_now)
 
         snap["history"] = rolling.get_all()
 
@@ -215,11 +238,13 @@ class MonitorDaemon:
         issue_mod.registry.update(detected)
         for issue in detected:
             alert_history.record(issue)
+            db.push_alert(issue.as_dict())
         snap["issues"] = [i.as_dict() for i in issue_mod.registry.get_active()]
         snap["alert_history"] = alert_history.get(50)
 
         with self._snapshot_lock:
             self._latest_snapshot = snap
+        self._last_tick_ts = time.time()
 
 
 # Singleton

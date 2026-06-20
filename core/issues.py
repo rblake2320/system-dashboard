@@ -9,6 +9,10 @@ from typing import Any
 
 from . import config as cfg
 
+# ── Hysteresis constants ──────────────────────────────────────────────────────
+CRITICAL_HYSTERESIS = 3   # must fire 3 consecutive checks before becoming active
+RESOLVE_HYSTERESIS = 2    # must be absent 2 consecutive checks before resolving
+
 
 @dataclass
 class Issue:
@@ -22,6 +26,8 @@ class Issue:
     context: dict = field(default_factory=dict)
     detected_at: float = field(default_factory=time.time)
     resolved: bool = False
+    state: str = "new"             # new | active | acknowledged | fixing | resolved | suppressed
+    suppressed_until: float | None = None  # epoch timestamp; None = not suppressed
 
     def as_dict(self) -> dict:
         return {
@@ -35,6 +41,7 @@ class Issue:
             "context": self.context,
             "detected_at": self.detected_at,
             "resolved": self.resolved,
+            "state": self.state,
         }
 
 
@@ -138,6 +145,69 @@ def detect_issues(snapshot: dict) -> list[Issue]:
                 context={"drive": letter, "stats": d},
             ))
 
+    # ── SMART / NVMe health ───────────────────────────────────────────────────
+    smart_health: dict[str, dict] = snapshot.get("smart_health", {})
+    for drive_letter, sh in smart_health.items():
+        health = sh.get("health", "Unknown")
+        temp = sh.get("temp_c")
+        wear = sh.get("wear_pct")
+        media_err = sh.get("media_errors") or 0
+        model = sh.get("model") or f"Drive {drive_letter}:"
+
+        if health == "Unhealthy":
+            issues.append(Issue(
+                id=_make_id("smart_unhealthy", drive_letter),
+                severity="critical", category="storage",
+                title=f"Drive {drive_letter}: SMART status Unhealthy — {model}",
+                description=(
+                    f"Drive {drive_letter}: ({model}) reports SMART health = Unhealthy. "
+                    f"Data loss is imminent. Back up immediately."
+                ),
+                fixer_id="storage_fixer",
+                fix_params={"action": "scan_drive", "drive": drive_letter},
+                context={"drive": drive_letter, "smart": sh},
+            ))
+
+        if wear is not None and wear < 10:
+            issues.append(Issue(
+                id=_make_id("smart_wear", drive_letter),
+                severity="critical", category="storage",
+                title=f"Drive {drive_letter}: NVMe wear < 10% remaining ({wear}%)",
+                description=(
+                    f"Drive {drive_letter}: ({model}) has only {wear}% of rated write "
+                    f"endurance remaining. Replace before it fails."
+                ),
+                fixer_id="storage_fixer",
+                fix_params={"action": "scan_drive", "drive": drive_letter},
+                context={"drive": drive_letter, "smart": sh},
+            ))
+
+        if temp is not None and temp > 70:
+            issues.append(Issue(
+                id=_make_id("smart_temp", drive_letter),
+                severity="warning", category="storage",
+                title=f"Drive {drive_letter}: High temp {temp}°C — {model}",
+                description=(
+                    f"Drive {drive_letter}: ({model}) temperature is {temp}°C, "
+                    f"above the 70°C warning threshold. Check airflow."
+                ),
+                context={"drive": drive_letter, "smart": sh},
+            ))
+
+        if media_err > 0:
+            issues.append(Issue(
+                id=_make_id("smart_media_errors", drive_letter),
+                severity="critical", category="storage",
+                title=f"Drive {drive_letter}: {media_err} media error(s) — {model}",
+                description=(
+                    f"Drive {drive_letter}: ({model}) has {media_err} media error(s) "
+                    f"logged by the controller. This indicates physical damage to NAND cells."
+                ),
+                fixer_id="storage_fixer",
+                fix_params={"action": "scan_drive", "drive": drive_letter},
+                context={"drive": drive_letter, "smart": sh},
+            ))
+
     # ── Processes ─────────────────────────────────────────────────────────────
     proc_cfg = {t["name"].lower(): t for t in cfg.processes()}
     for exe_name, pdata in procs.items():
@@ -180,27 +250,60 @@ class IssueRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._issues: dict[str, Issue] = {}
+        self._fire_count: dict[str, int] = {}   # consecutive checks issue was detected
+        self._clear_count: dict[str, int] = {}  # consecutive checks issue was absent
 
     def update(self, new_issues: list[Issue]) -> None:
         new_ids = {i.id for i in new_issues}
         with self._lock:
-            # Mark resolved
+            # Track absent issues — increment clear counter, resolve after hysteresis
             for iid in list(self._issues):
-                if iid not in new_ids:
-                    self._issues[iid].resolved = True
-            # Add/update
+                issue = self._issues[iid]
+                if iid not in new_ids and not issue.resolved and issue.state != "suppressed":
+                    self._clear_count[iid] = self._clear_count.get(iid, 0) + 1
+                    self._fire_count[iid] = 0  # reset fire counter
+                    if self._clear_count[iid] >= RESOLVE_HYSTERESIS:
+                        issue.resolved = True
+                        issue.state = "resolved"
+
+            # Track detected issues — increment fire counter, add after hysteresis
             for issue in new_issues:
-                if issue.id not in self._issues:
-                    self._issues[issue.id] = issue
+                iid = issue.id
+                self._clear_count[iid] = 0  # reset clear counter — issue is present
+
+                if iid not in self._issues:
+                    # Pending: not yet in registry — check fire count
+                    self._fire_count[iid] = self._fire_count.get(iid, 0) + 1
+                    if self._fire_count[iid] >= CRITICAL_HYSTERESIS:
+                        self._fire_count[iid] = 0  # reset after crossing threshold
+                        self._issues[iid] = issue   # now active
                 else:
-                    existing = self._issues[issue.id]
-                    existing.resolved = False
+                    existing = self._issues[iid]
+                    if existing.state not in ("acknowledged", "fixing", "suppressed"):
+                        existing.resolved = False
+                        if existing.state == "resolved":
+                            existing.state = "new"
+                        elif existing.state == "new":
+                            existing.state = "active"
                     existing.title = issue.title
                     existing.description = issue.description
 
     def get_active(self) -> list[Issue]:
+        """Return issues that are not resolved or suppressed."""
+        now = time.time()
         with self._lock:
-            return [i for i in self._issues.values() if not i.resolved]
+            result = []
+            for i in self._issues.values():
+                if i.resolved:
+                    continue
+                if i.state == "suppressed":
+                    # Auto-lift suppression if the time window has elapsed
+                    if i.suppressed_until is not None and now >= i.suppressed_until:
+                        i.state = "active"
+                    else:
+                        continue
+                result.append(i)
+            return result
 
     def get_all(self) -> list[Issue]:
         with self._lock:
@@ -214,6 +317,23 @@ class IssueRegistry:
         with self._lock:
             if issue_id in self._issues:
                 self._issues[issue_id].resolved = True
+                self._issues[issue_id].state = "resolved"
+
+    def acknowledge(self, issue_id: str) -> None:
+        with self._lock:
+            if issue_id in self._issues:
+                self._issues[issue_id].state = "acknowledged"
+
+    def suppress(self, issue_id: str, until_ts: float | None = None) -> None:
+        with self._lock:
+            if issue_id in self._issues:
+                self._issues[issue_id].state = "suppressed"
+                self._issues[issue_id].suppressed_until = until_ts
+
+    def mark_fixing(self, issue_id: str) -> None:
+        with self._lock:
+            if issue_id in self._issues:
+                self._issues[issue_id].state = "fixing"
 
     def clear_resolved(self) -> None:
         with self._lock:

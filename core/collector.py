@@ -1,7 +1,9 @@
 """System data collector — psutil + nvidia-smi, config-driven."""
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,247 @@ from typing import Any
 import psutil
 
 from . import config as cfg
+
+# ── SMART / NVMe health ───────────────────────────────────────────────────────
+
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _run_ps(command: str, timeout: int = 3) -> str | None:
+    """Run a PowerShell command and return stdout, or None on failure."""
+    flags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        result = subprocess.run(
+            ["powershell", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=flags,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _ps_get_physical_disks() -> list[dict]:
+    """Return list of physical disk dicts from Get-PhysicalDisk."""
+    raw = _run_ps(
+        "Get-PhysicalDisk | Select-Object DeviceId,FriendlyName,HealthStatus,"
+        "OperationalStatus,Size | ConvertTo-Json"
+    )
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _ps_get_reliability_counters(disk_list: list[dict]) -> list[dict]:
+    """Return reliability counters for all physical disks."""
+    raw = _run_ps(
+        "Get-StorageReliabilityCounter -PhysicalDisk (Get-PhysicalDisk) | "
+        "Select-Object DeviceId,Temperature,ReadErrorsTotal,WriteErrorsTotal,Wear | "
+        "ConvertTo-Json"
+    )
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _ps_drive_letter_map() -> dict[str, str]:
+    """Return mapping of DeviceId → drive letter(s) via Get-Partition."""
+    raw = _run_ps(
+        "Get-Partition | Where-Object {$_.DriveLetter} | "
+        "Select-Object DiskNumber,DriveLetter | ConvertTo-Json"
+    )
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        mapping: dict[str, str] = {}
+        for item in data:
+            disk_num = str(item.get("DiskNumber", ""))
+            letter = item.get("DriveLetter", "")
+            if disk_num and letter:
+                mapping[disk_num] = str(letter).strip()
+        return mapping
+    except Exception:
+        return {}
+
+
+def _smart_via_powershell() -> dict[str, dict]:
+    """Collect SMART data via PowerShell Get-PhysicalDisk + Get-StorageReliabilityCounter."""
+    disks = _ps_get_physical_disks()
+    if not disks:
+        return {}
+
+    reliability = _ps_get_reliability_counters(disks)
+    rel_by_id: dict[str, dict] = {str(r.get("DeviceId", "")): r for r in reliability}
+    letter_map = _ps_drive_letter_map()  # DiskNumber → letter
+
+    result: dict[str, dict] = {}
+    for disk in disks:
+        dev_id = str(disk.get("DeviceId", ""))
+        disk_num = dev_id  # DeviceId == DiskNumber in Windows storage stack
+        letter = letter_map.get(disk_num)
+        if not letter:
+            continue
+
+        health_raw = (disk.get("HealthStatus") or "Unknown").strip()
+        # Normalise: Healthy / Warning / Unhealthy / Unknown
+        health_map = {"healthy": "Healthy", "warning": "Warning",
+                      "unhealthy": "Unhealthy", "unknown": "Unknown"}
+        health = health_map.get(health_raw.lower(), health_raw)
+
+        rel = rel_by_id.get(dev_id, {})
+
+        def _int(v: Any) -> int | None:
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        temp = _int(rel.get("Temperature"))
+        read_err = _int(rel.get("ReadErrorsTotal")) or 0
+        write_err = _int(rel.get("WriteErrorsTotal")) or 0
+        wear = _int(rel.get("Wear"))  # 0-100, remaining life in %
+
+        result[letter] = {
+            "health": health,
+            "temp_c": temp,
+            "read_errors": read_err,
+            "write_errors": write_err,
+            "wear_pct": wear,
+            "media_errors": 0,        # not surfaced by PS cmdlet
+            "available_spare_pct": None,
+            "model": (disk.get("FriendlyName") or "").strip(),
+            "method": "powershell",
+        }
+    return result
+
+
+def _smart_via_smartctl() -> dict[str, dict]:
+    """Collect SMART data via smartctl (if installed)."""
+    flags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    result: dict[str, dict] = {}
+
+    # Build a list of candidates: \\.\PhysicalDrive0 … PhysicalDrive9 on Windows,
+    # /dev/sda … /dev/sdz on Linux.
+    if sys.platform == "win32":
+        candidates = [f"\\\\.\\PhysicalDrive{n}" for n in range(6)]
+    else:
+        candidates = [f"/dev/sd{chr(c)}" for c in range(ord('a'), ord('g'))]
+
+    for device in candidates:
+        try:
+            proc = subprocess.run(
+                ["smartctl", "-a", "-j", device],
+                capture_output=True, text=True, timeout=3,
+                creationflags=flags,
+            )
+            if proc.returncode not in (0, 4) or not proc.stdout.strip():
+                continue
+            data = json.loads(proc.stdout)
+        except Exception:
+            continue
+
+        # Drive letter mapping on Windows
+        letter = None
+        if sys.platform == "win32":
+            try:
+                dev_num = device.replace("\\\\.\\PhysicalDrive", "")
+                raw = _run_ps(
+                    f"Get-Partition -DiskNumber {dev_num} | "
+                    f"Where-Object {{$_.DriveLetter}} | "
+                    f"Select-Object -First 1 -ExpandProperty DriveLetter"
+                )
+                if raw:
+                    letter = raw.strip()
+            except Exception:
+                pass
+        if not letter:
+            continue  # can't associate with a drive letter
+
+        smart_status = data.get("smart_status", {})
+        health_ok = smart_status.get("passed", True)
+        health = "Healthy" if health_ok else "Unhealthy"
+
+        temp_obj = data.get("temperature", {})
+        temp = temp_obj.get("current") if temp_obj else None
+
+        # NVMe-specific fields
+        nvme = data.get("nvme_smart_health_information_log", {})
+        media_errors = nvme.get("media_errors", 0)
+        spare_pct = nvme.get("available_spare", None)
+        wear_level = nvme.get("percentage_used", None)
+        wear_pct = (100 - wear_level) if wear_level is not None else None
+
+        # ATA error counts
+        ata_errors = data.get("ata_smart_error_log", {})
+        read_err = 0
+        write_err = 0
+        if not nvme:
+            for attr in data.get("ata_smart_attributes", {}).get("table", []):
+                aid = attr.get("id")
+                raw_val = attr.get("raw", {}).get("value", 0)
+                if aid in (1, 7):    # Raw_Read_Error_Rate / Seek_Error_Rate
+                    read_err += raw_val
+                elif aid == 199:      # UDMA_CRC_Error_Count → write path errors
+                    write_err += raw_val
+
+        model_info = data.get("model_name", "") or data.get("model_family", "")
+
+        result[letter] = {
+            "health": health,
+            "temp_c": temp,
+            "read_errors": read_err,
+            "write_errors": write_err,
+            "wear_pct": wear_pct,
+            "media_errors": media_errors,
+            "available_spare_pct": spare_pct,
+            "model": model_info,
+            "method": "smartctl",
+        }
+    return result
+
+
+def get_smart_health() -> dict[str, dict]:
+    """Return SMART/NVMe health data keyed by drive letter.
+
+    Tries PowerShell cmdlets first (no extra tools needed on Windows),
+    then falls back to smartctl.  Returns empty dict on any failure.
+    Guaranteed to complete within ~6 seconds (3s per method).
+    """
+    if sys.platform != "win32":
+        # On non-Windows just try smartctl
+        try:
+            return _smart_via_smartctl()
+        except Exception:
+            return {}
+
+    try:
+        ps_data = _smart_via_powershell()
+        if ps_data:
+            return ps_data
+    except Exception:
+        pass
+
+    try:
+        return _smart_via_smartctl()
+    except Exception:
+        return {}
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
 
@@ -357,4 +600,5 @@ def build_snapshot() -> dict:
         "network": get_network_connections(),
         "hooks": get_hook_status(),
         "projects": get_project_status(),
+        "smart_health": get_smart_health(),
     }

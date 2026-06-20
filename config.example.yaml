@@ -75,6 +75,15 @@ projects: []
 #   - name: "API Server"
 #     path: "~/projects/api"
 
+# Auth: protect mutating endpoints (kill, fix, diagnose).
+# Default is disabled — safe for localhost-only use.
+# Enable if you expose the dashboard to a LAN or tunnel.
+auth:
+  enabled: false   # set to true to require X-Dashboard-Token header on mutating routes
+
+security:
+  allow_kill_any_pid: false  # if false, only tracked processes can be killed
+
 # External IPs to name in the Network panel.
 known_ips: {}
 # Example:
