@@ -24,6 +24,7 @@ from core.persistence import db
 from core.auth import require_token, generate_token, print_startup_token, issue_sse_ticket, require_sse_ticket
 from core.audit import log_action
 from core.pid_guard import pid_guard
+from core.key_monitor import check_all_keys, refresh_provider
 from daemon.monitor import daemon, alert_history
 from agents.ollama import get_agent
 from fixers.process_fixer import ProcessFixer
@@ -130,6 +131,22 @@ def api_alert_history():
 @app.route("/api/actions")
 def api_actions():
     return jsonify(db.get_actions(limit=100))
+
+
+@app.route("/api/keys")
+def api_keys():
+    """Return masked API key health status for all configured providers."""
+    force = request.args.get("refresh") == "1"
+    return jsonify(check_all_keys(force=force))
+
+
+@app.route("/api/keys/<provider_id>/refresh", methods=["POST"])
+def api_key_refresh(provider_id: str):
+    """Force-refresh a single provider's key status."""
+    result = refresh_provider(provider_id)
+    if result is None:
+        return jsonify({"error": f"Unknown provider: {provider_id}"}), 404
+    return jsonify(result)
 
 
 @app.route("/api/diagnose", methods=["POST"])
@@ -601,6 +618,24 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
 .io-row{font-size:11px;color:var(--cyan);margin-top:3px}
 .gpu-card{border-top:2px solid var(--accent2)}
 .sep{height:1px;background:var(--border);margin:10px 0}
+.key-card{background:var(--surface2);border-radius:8px;padding:12px 14px;border:1px solid var(--border)}
+.key-card.active{border-color:rgba(34,197,94,.35)}
+.key-card.invalid{border-color:rgba(239,68,68,.4);background:rgba(239,68,68,.04)}
+.key-card.not_configured{border-color:var(--border);opacity:.6}
+.key-card.rate_limited{border-color:rgba(234,179,8,.4)}
+.key-icon{width:28px;height:28px;border-radius:6px;background:var(--border);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
+.key-top{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.key-name{font-size:13px;font-weight:600}
+.key-masked{font-size:10px;color:var(--muted);font-family:monospace}
+.key-status{font-size:11px;font-weight:600;margin-top:3px}
+.ks-active{color:var(--green)}
+.ks-invalid{color:var(--red)}
+.ks-not_configured{color:var(--muted)}
+.ks-rate_limited{color:var(--yellow)}
+.ks-unreachable{color:var(--orange)}
+.ks-error{color:var(--orange)}
+.key-cost{font-size:11px;color:var(--cyan);margin-top:4px}
+.key-actions{display:flex;gap:6px;margin-top:8px}
 </style>
 </head>
 <body>
@@ -660,6 +695,16 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
     <div class="card-title">Network Connections</div>
     <div id="net-ext"></div>
     <div id="net-int"></div>
+  </div>
+
+  <!-- API Keys -->
+  <div class="card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>API Keys</span>
+      <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="recheckAllKeys()">Re-check All</button>
+    </div>
+    <div id="keys-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
+    <div style="font-size:10px;color:var(--muted);margin-top:10px">Keys read from environment variables. Only last 4 chars shown. Cost data requires admin key env var (ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY). Cached 5 min.</div>
   </div>
 
   <!-- Bottom row -->
@@ -978,6 +1023,64 @@ function render(snap){
   renderProj(snap);
   renderHooks(snap);
 }
+
+// ── API Keys ─────────────────────────────────────────────────────────────────
+const STATUS_LABEL = {
+  active:'Active', invalid:'Invalid — key rejected', not_configured:'Not configured',
+  rate_limited:'Rate limited (key OK)', unreachable:'Unreachable', error:'Error',
+  unknown:'Unknown',
+};
+function renderKeys(data){
+  const grid=document.getElementById('keys-grid');
+  if(!data||!Object.keys(data).length){
+    grid.innerHTML='<div style="color:var(--muted);font-size:12px">Loading...</div>';return;
+  }
+  grid.innerHTML=Object.entries(data).map(([pid,p])=>{
+    const v=p.validation||{};
+    const st=v.status||'unknown';
+    const label=STATUS_LABEL[st]||st;
+    const costHtml=p.cost
+      ? (p.cost.error
+          ? `<div class="key-cost">Cost: error (${p.cost.error})</div>`
+          : `<div class="key-cost">Cost MTD: $${(p.cost.usd||0).toFixed(4)}</div>`)
+      : (p.cost_available && !p.has_admin_key
+          ? `<div style="font-size:10px;color:var(--muted)">Add ${pid.toUpperCase()}_ADMIN_KEY for cost</div>`
+          : (!p.cost_available && p.found ? `<div style="font-size:10px;color:var(--muted)">Cost: no API available</div>` : ''));
+    const rotateBtn=p.rotate_url
+      ? `<a href="${p.rotate_url}" target="_blank" class="btn btn-neutral" style="font-size:10px;padding:3px 8px">Rotate Key</a>`
+      : '';
+    const recheckBtn=`<button class="btn btn-neutral" style="font-size:10px;padding:3px 8px" onclick="recheckKey('${pid}')">Re-check</button>`;
+    return`<div class="key-card ${st}">
+      <div class="key-top">
+        <div class="key-icon">${esc(p.icon||'?')}</div>
+        <div>
+          <div class="key-name">${esc(p.label)}</div>
+          <div class="key-masked">${p.masked||'(no key)'}</div>
+        </div>
+      </div>
+      <div class="key-status ks-${st}">${label}</div>
+      ${v.models?`<div style="font-size:10px;color:var(--muted)">${v.models} models available</div>`:''}
+      ${v.error&&st!=='active'?`<div style="font-size:10px;color:var(--muted)">${esc(v.error)}</div>`:''}
+      ${costHtml}
+      <div style="font-size:9px;color:var(--muted);margin-top:4px">Checked ${esc(p.checked_at||'—')}</div>
+      <div class="key-actions">${rotateBtn}${recheckBtn}</div>
+    </div>`;
+  }).join('');
+}
+function recheckKey(pid){
+  const grid=document.getElementById('keys-grid');
+  fetch('/api/keys/'+pid+'/refresh',{method:'POST'})
+    .then(r=>r.json()).then(()=>fetchKeys()).catch(e=>console.error(e));
+}
+function recheckAllKeys(){
+  fetch('/api/keys?refresh=1').then(r=>r.json()).then(renderKeys).catch(e=>console.error(e));
+}
+function fetchKeys(){
+  fetch('/api/keys').then(r=>r.json()).then(renderKeys).catch(e=>console.error(e));
+}
+// Load keys on startup and every 5 minutes
+fetchKeys();
+setInterval(fetchKeys, 300*1000);
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 function fetchStatus(){
