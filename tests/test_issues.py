@@ -228,3 +228,120 @@ def test_issue_as_dict_values():
     assert d["fixer_id"] == "process_fixer"
     assert d["fix_params"] == {"action": "list_top_cpu"}
     assert d["resolved"] is False
+
+
+# ── IssueRegistry state transitions: acknowledge ──────────────────────────────
+
+def test_registry_acknowledge_sets_state():
+    reg = IssueRegistry()
+    issue = Issue(id="ack001", severity="warning", category="system",
+                  title="Ack test", description="Testing acknowledge.")
+    _activate(reg, issue)
+    reg.acknowledge("ack001")
+    found = reg.get("ack001")
+    assert found is not None
+    assert found.state == "acknowledged", f"Expected 'acknowledged', got '{found.state}'"
+
+
+def test_registry_acknowledge_keeps_issue_active():
+    """Acknowledged issues should not appear as resolved."""
+    reg = IssueRegistry()
+    issue = Issue(id="ack002", severity="warning", category="system",
+                  title="Ack2", description="Ack keeps issue alive.")
+    _activate(reg, issue)
+    reg.acknowledge("ack002")
+    found = reg.get("ack002")
+    assert found is not None
+    assert found.resolved is False
+
+
+# ── IssueRegistry state transitions: suppress ────────────────────────────────
+
+def test_registry_suppress_hides_from_get_active():
+    """Suppressed issues must not appear in get_active()."""
+    reg = IssueRegistry()
+    issue = Issue(id="sup001", severity="critical", category="system",
+                  title="Suppress test", description="Testing suppress.")
+    _activate(reg, issue)
+    # Suppress for 1 hour into the future
+    import time as _time
+    reg.suppress("sup001", until_ts=_time.time() + 3600)
+    active = reg.get_active()
+    assert not any(i.id == "sup001" for i in active), \
+        "Suppressed issue should not appear in get_active()"
+
+
+def test_registry_suppress_expired_auto_lifts():
+    """A suppression with an already-expired timestamp must auto-lift on next get_active()."""
+    import time as _time
+    reg = IssueRegistry()
+    issue = Issue(id="sup002", severity="critical", category="system",
+                  title="Expired suppress", description="Testing expired suppress.")
+    _activate(reg, issue)
+    # Suppress with a timestamp in the past
+    reg.suppress("sup002", until_ts=_time.time() - 1)
+    active = reg.get_active()
+    assert any(i.id == "sup002" for i in active), \
+        "Issue with expired suppression should auto-lift and appear in get_active()"
+
+
+def test_registry_suppress_sets_state():
+    """suppress() must set state to 'suppressed'."""
+    reg = IssueRegistry()
+    issue = Issue(id="sup003", severity="info", category="system",
+                  title="S3", description="d")
+    _activate(reg, issue)
+    import time as _time
+    reg.suppress("sup003", until_ts=_time.time() + 60)
+    found = reg.get("sup003")
+    assert found is not None
+    assert found.state == "suppressed"
+
+
+# ── IssueRegistry state transitions: mark_fixing ─────────────────────────────
+
+def test_registry_mark_fixing_sets_state():
+    reg = IssueRegistry()
+    issue = Issue(id="fix001", severity="critical", category="system",
+                  title="Fix test", description="Testing mark_fixing.")
+    _activate(reg, issue)
+    reg.mark_fixing("fix001")
+    found = reg.get("fix001")
+    assert found is not None
+    assert found.state == "fixing", f"Expected 'fixing', got '{found.state}'"
+
+
+def test_registry_mark_fixing_not_resolved():
+    """mark_fixing must not mark the issue as resolved."""
+    reg = IssueRegistry()
+    issue = Issue(id="fix002", severity="warning", category="system",
+                  title="Fix2", description="d")
+    _activate(reg, issue)
+    reg.mark_fixing("fix002")
+    found = reg.get("fix002")
+    assert found is not None
+    assert found.resolved is False
+
+
+# ── IssueRegistry: resolve() directly ────────────────────────────────────────
+
+def test_registry_resolve_direct_marks_resolved():
+    reg = IssueRegistry()
+    issue = Issue(id="res001", severity="warning", category="system",
+                  title="Resolve direct", description="d")
+    _activate(reg, issue)
+    reg.resolve("res001")
+    found = reg.get("res001")
+    assert found is not None
+    assert found.resolved is True
+    assert found.state == "resolved"
+
+
+def test_registry_resolve_direct_not_in_active():
+    reg = IssueRegistry()
+    issue = Issue(id="res002", severity="critical", category="system",
+                  title="Resolve2", description="d")
+    _activate(reg, issue)
+    reg.resolve("res002")
+    active = reg.get_active()
+    assert not any(i.id == "res002" for i in active)

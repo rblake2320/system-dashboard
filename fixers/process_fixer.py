@@ -95,23 +95,47 @@ class ProcessFixer(FixerBase):
         if not pid:
             yield "FAILED: no PID specified"
             return
-        yield f"Terminating PID {pid}..."
         try:
-            proc = psutil.Process(int(pid))
-            name = proc.name()
+            pid_int = int(pid)
+        except (ValueError, TypeError):
+            yield f"FAILED: pid {pid!r} is not an integer"
+            return
+
+        # Guard: validate the kill regardless of which code path called us.
+        from core.pid_guard import pid_guard
+        from daemon.monitor import daemon as _daemon
+        snap = _daemon.latest() or {}
+        ok, reason = pid_guard.validate_kill(pid_int, snap)
+        if not ok:
+            yield f"FAILED: Kill blocked by pid_guard — {reason}"
+            return
+
+        yield f"Terminating PID {pid_int}..."
+        try:
+            proc = psutil.Process(pid_int)
+            # Capture identity before kill for PID-reuse defence
+            _name = proc.name()
+            _ctime = proc.create_time()
             proc.terminate()
             time.sleep(0.5)
-            if proc.is_running():
-                proc.kill()
-                yield f"Force-killed {name} (PID {pid})"
-            else:
-                yield f"Terminated {name} (PID {pid}) cleanly"
+            try:
+                # Re-confirm identity has not changed (PID-reuse race)
+                if proc.is_running():
+                    if abs(proc.create_time() - _ctime) > 1.0 or proc.name() != _name:
+                        yield f"FAILED: PID {pid_int} identity changed mid-kill (PID reuse); aborting"
+                        return
+                    proc.kill()
+                    yield f"Force-killed {_name} (PID {pid_int})"
+                else:
+                    yield f"Terminated {_name} (PID {pid_int}) cleanly"
+            except psutil.NoSuchProcess:
+                yield f"Terminated {_name} (PID {pid_int}) cleanly"
             yield "DONE"
         except psutil.NoSuchProcess:
-            yield f"PID {pid} not found — already exited"
+            yield f"PID {pid_int} not found — already exited"
             yield "DONE"
         except psutil.AccessDenied:
-            yield f"FAILED: Access denied for PID {pid}"
+            yield f"FAILED: Access denied for PID {pid_int}"
         except Exception as e:
             yield f"FAILED: {e}"
 

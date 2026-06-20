@@ -21,7 +21,7 @@ from flask import Flask, Response, jsonify, request, stream_with_context
 
 from core import config as cfg, collector, issues as issue_mod
 from core.persistence import db
-from core.auth import require_token, generate_token, print_startup_token
+from core.auth import require_token, generate_token, print_startup_token, issue_sse_ticket, require_sse_ticket
 from core.audit import log_action
 from core.pid_guard import pid_guard
 from daemon.monitor import daemon, alert_history
@@ -168,10 +168,28 @@ def api_diagnose():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/fix/ticket", methods=["POST"])
+def api_fix_ticket():
+    """Exchange the main session token (header) for a single-use 30-second SSE ticket.
+
+    EventSource cannot send custom headers, so the UI must POST here first,
+    then open the EventSource with ?ticket=<ticket>.  This keeps the main token
+    out of the server access log entirely.
+    """
+    if not require_token(request):
+        log_action("fix_ticket", {}, request.remote_addr or "", "rejected: missing token")
+        return jsonify({"error": "Unauthorized"}), 401
+    ticket = issue_sse_ticket()
+    log_action("fix_ticket", {}, request.remote_addr or "", "issued")
+    return jsonify({"ticket": ticket})
+
+
 @app.route("/api/fix/stream")
 def api_fix_stream():
-    if not require_token(request):
-        log_action("fix_stream", {}, request.remote_addr or "", "rejected: missing token")
+    # Validate via single-use SSE ticket (avoids main token in query-string / access log)
+    ticket = request.args.get("ticket")
+    if not require_sse_ticket(ticket):
+        log_action("fix_stream", {}, request.remote_addr or "", "rejected: invalid or missing ticket")
         def _unauth():
             yield "data: Unauthorized\n\n"
             yield "data: FAILED\n\n"
@@ -389,6 +407,18 @@ def api_kill_pid():
     except (ValueError, TypeError):
         return jsonify({"error": "pid must be an integer"}), 400
     snap = daemon.latest() or {}
+
+    # Capture process identity at validation time to defend against PID-reuse races.
+    # We record (name, create_time) now and re-verify them immediately before killing.
+    try:
+        import psutil as _psutil
+        _proc_snapshot = _psutil.Process(pid)
+        _snap_name = _proc_snapshot.name()
+        _snap_ctime = _proc_snapshot.create_time()
+    except Exception:
+        _snap_name = None
+        _snap_ctime = None
+
     ok, reason = pid_guard.validate_kill(pid, snap)
     log_action(
         "kill_pid",
@@ -399,6 +429,18 @@ def api_kill_pid():
     )
     if not ok:
         return jsonify({"error": f"Kill blocked: {reason}"}), 403
+
+    # Re-verify identity before executing kill to prevent PID-reuse race.
+    if _snap_name is not None and _snap_ctime is not None:
+        try:
+            import psutil as _psutil2
+            _proc_now = _psutil2.Process(pid)
+            if _proc_now.name() != _snap_name or abs(_proc_now.create_time() - _snap_ctime) > 1.0:
+                log_action("kill_pid", {"pid": pid}, request.remote_addr or "", "blocked: PID reuse detected")
+                return jsonify({"error": "Kill blocked: process identity changed (PID reuse detected)"}), 409
+        except Exception:
+            pass  # process already gone — fixer will handle it
+
     fixer = ProcessFixer()
     lines = list(fixer.fix({"fixer_id": "process_fixer", "fix_params": {"action": "kill_by_pid", "pid": pid}}))
     success = any("DONE" in l for l in lines)
@@ -991,18 +1033,35 @@ function diagnose(id,title){
 }
 
 // ── Fix ───────────────────────────────────────────────────────────────────────
+// EventSource cannot send custom headers, so we exchange the session token for a
+// single-use 30-second ticket via POST /api/fix/ticket, then open the SSE stream
+// with ?ticket=<ticket>.  This keeps the main token out of server access logs.
 function runFix(id,fixerId,title){
   if(!confirm('Run automated fix for:\n'+title))return;
   document.getElementById('diag-box').style.display='none';
   openModal('Fixing: '+title);
-  const es=new EventSource('/api/fix/stream?issue_id='+encodeURIComponent(id)+'&fixer_id='+fixerId);
-  es.onmessage=e=>{
-    const l=e.data;
-    const cls=l.startsWith('DONE')?'t-done':l.startsWith('FAILED')?'t-fail':'';
-    addLine(l+'\n',cls);
-    if(l==='DONE'||l.startsWith('FAILED')){es.close();if(l==='DONE')setTimeout(fetchStatus,1000);}
-  };
-  es.onerror=()=>{addLine('Stream ended.\n');es.close();};
+  const token=window._dashToken||'';
+  // Step 1: obtain a short-lived SSE ticket
+  fetch('/api/fix/ticket',{
+    method:'POST',
+    headers:token?{'X-Dashboard-Token':token}:{},
+  }).then(r=>{
+    if(!r.ok){addLine('Auth error obtaining SSE ticket (status '+r.status+')\n','t-fail');return;}
+    return r.json();
+  }).then(data=>{
+    if(!data)return;
+    const ticket=data.ticket||'';
+    // Step 2: open EventSource with the single-use ticket
+    const url='/api/fix/stream?issue_id='+encodeURIComponent(id)+'&fixer_id='+encodeURIComponent(fixerId)+(ticket?'&ticket='+encodeURIComponent(ticket):'');
+    const es=new EventSource(url);
+    es.onmessage=e=>{
+      const l=e.data;
+      const cls=l.startsWith('DONE')?'t-done':l.startsWith('FAILED')?'t-fail':'';
+      addLine(l+'\n',cls);
+      if(l==='DONE'||l.startsWith('FAILED')){es.close();if(l==='DONE')setTimeout(fetchStatus,1000);}
+    };
+    es.onerror=()=>{addLine('Stream ended.\n');es.close();};
+  }).catch(e=>addLine('ERROR: '+e+'\n','t-fail'));
 }
 
 // ── Modal ────────────────────────────────────────────────────────────────────

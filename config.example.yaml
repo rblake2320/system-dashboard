@@ -44,6 +44,14 @@ processes:
 
 # Ports to monitor. Add any you care about.
 services:
+  # Allowlist for NSSM/sc.exe service restarts.  When non-empty, only these
+  # service names can be restarted via the service_fixer.  Leave empty ([]) to
+  # allow any name (not recommended on exposed installs).
+  allowed_service_names: []
+  # Example:
+  # allowed_service_names:
+  #   - "MemoryWeb-API"
+  #   - "MemoryWeb-Celery"
   ports:
     8099: "This Dashboard"
     8100: "MemoryWeb API"
@@ -78,8 +86,12 @@ projects: []
 # Auth: protect mutating endpoints (kill, fix, diagnose).
 # Default is disabled — safe for localhost-only use.
 # Enable if you expose the dashboard to a LAN or tunnel.
+# WARNING: when auth.enabled is true, tokens in query strings appear in access
+# logs.  The dashboard mitigates this by routing SSE through /api/fix/ticket
+# (short-lived ticket exchange) so the main token never appears in the SSE URL.
 auth:
-  enabled: false   # set to true to require X-Dashboard-Token header on mutating routes
+  enabled: false  # set to true to require X-Dashboard-Token header
+  token: ""       # leave empty to auto-generate a token on each server restart
 
 security:
   allow_kill_any_pid: false  # if false, only tracked processes can be killed

@@ -112,6 +112,17 @@ class PIDGuard:
                     f"service_fixer: action '{action}' not in allowed set "
                     f"{sorted(_ALLOWED_SERVICE_ACTIONS)}",
                 )
+            if action == "restart_nssm":
+                service_name = str(params.get("service_name", ""))
+                # validate_kill-style guard: also check allowlist here
+                from core import config as _cfg
+                allowed = _cfg.get().get("services", {}).get("allowed_service_names", [])
+                if allowed and service_name not in allowed:
+                    return (
+                        False,
+                        f"service_fixer: service_name '{service_name}' not in "
+                        f"services.allowed_service_names",
+                    )
             return True, f"service_fixer: action '{action}' is allowed"
 
         if fixer_id == "storage_fixer":

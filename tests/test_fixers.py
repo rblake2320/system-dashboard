@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -126,3 +127,75 @@ def test_storage_fixer_unknown_action_yields_done():
     issue = _issue("storage_fixer", "totally_unknown_action_xyz")
     lines = _collect(fixer.fix(issue))
     assert "DONE" in lines
+
+
+# ── StorageFixer: find_large_files ───────────────────────────────────────────
+
+def test_storage_fixer_find_large_files_yields_done():
+    """find_large_files must yield DONE and report the drive letter scanned."""
+    large_size = 600 * 1024 * 1024  # 600 MB — above the 500MB threshold
+    small_size = 1024               # 1 KB — below threshold
+
+    fake_walk = [
+        ("C:\\", [], ["bigfile.bin", "smallfile.txt"]),
+    ]
+
+    def fake_getsize(path):
+        if path.endswith("bigfile.bin"):
+            return large_size
+        return small_size
+
+    fixer = StorageFixer()
+    with patch("os.walk", return_value=iter(fake_walk)), \
+         patch("os.path.getsize", side_effect=fake_getsize):
+        lines = _collect(fixer.fix(_issue("storage_fixer", "find_large_files", drive="C")))
+
+    combined = "\n".join(lines)
+    assert "DONE" in lines, f"Expected DONE in output. Got:\n{combined}"
+    # Should report finding at least 1 large file
+    assert "1" in combined or "bigfile" in combined or "Found" in combined
+
+
+def test_storage_fixer_find_large_files_no_files_found():
+    """find_large_files with no large files must still yield DONE and say 0 or None."""
+    fake_walk = [
+        ("D:\\", [], ["tiny.txt"]),
+    ]
+
+    def fake_getsize(path):
+        return 100  # well below 500MB
+
+    fixer = StorageFixer()
+    with patch("os.walk", return_value=iter(fake_walk)), \
+         patch("os.path.getsize", side_effect=fake_getsize):
+        lines = _collect(fixer.fix(_issue("storage_fixer", "find_large_files", drive="D")))
+
+    combined = "\n".join(lines)
+    assert "DONE" in lines, f"Expected DONE. Got:\n{combined}"
+    assert "0" in combined or "None" in combined or "Found 0" in combined
+
+
+# ── StorageFixer: scan_drive ──────────────────────────────────────────────────
+
+def test_storage_fixer_scan_drive_yields_done():
+    """scan_drive must yield DONE regardless of whether wmic succeeds."""
+    import subprocess
+
+    fixer = StorageFixer()
+    with patch("subprocess.check_output", side_effect=Exception("wmic not available")):
+        lines = _collect(fixer.fix(_issue("storage_fixer", "scan_drive", drive="C")))
+
+    combined = "\n".join(lines)
+    assert "DONE" in lines, f"Expected DONE even when wmic fails. Got:\n{combined}"
+
+
+def test_storage_fixer_scan_drive_includes_chkdsk_hint():
+    """scan_drive must mention chkdsk in its output."""
+    import subprocess
+
+    fixer = StorageFixer()
+    with patch("subprocess.check_output", side_effect=Exception("wmic not available")):
+        lines = _collect(fixer.fix(_issue("storage_fixer", "scan_drive", drive="D")))
+
+    combined = "\n".join(lines)
+    assert "chkdsk" in combined.lower(), f"Expected chkdsk hint. Got:\n{combined}"

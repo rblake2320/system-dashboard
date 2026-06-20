@@ -33,6 +33,18 @@ class ServiceFixer(FixerBase):
 
     def _restart_nssm(self, params: dict) -> Generator[str, None, None]:
         service_name = params.get("service_name", "")
+
+        # Validate service_name against the config allowlist (services.allowed_service_names).
+        # If the allowlist is absent or empty, any name is permitted (backward-compatible).
+        from core import config as cfg
+        allowed_names = cfg.get().get("services", {}).get("allowed_service_names", [])
+        if allowed_names and service_name not in allowed_names:
+            yield (
+                f"FAILED: service_name '{service_name}' is not in the allowed list. "
+                f"Add it to services.allowed_service_names in config.yaml."
+            )
+            return
+
         yield f"Attempting to restart NSSM service: {service_name}..."
         nssm_paths = [
             r"D:\tools\nssm\nssm.exe",

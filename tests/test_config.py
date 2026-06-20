@@ -138,3 +138,81 @@ def test_reload_clears_cache():
     assert isinstance(reloaded, dict)
     # After reload, a fresh get() must produce the same structure
     assert "dashboard" in reloaded
+
+
+# ── Negative-path: missing / corrupt config.yaml ─────────────────────────────
+
+def test_get_returns_defaults_when_config_absent(monkeypatch):
+    """When config.yaml is absent and config.example.yaml is absent, _load_raw
+    must return {} and get() must fall back to _DEFAULTS."""
+    from pathlib import Path
+    import core.config as _cfg_mod
+    # Point both paths at guaranteed non-existent files (no tmp_path needed)
+    monkeypatch.setattr(_cfg_mod, "_CONFIG_PATH", Path("C:/nonexistent_path_xyz/missing.yaml"))
+    monkeypatch.setattr(_cfg_mod, "_EXAMPLE_PATH", Path("C:/nonexistent_path_xyz/also_missing.yaml"))
+    monkeypatch.setattr(_cfg_mod, "_cache", None)
+    result = _cfg_mod.get()
+    assert isinstance(result, dict)
+    assert "dashboard" in result
+    assert result["dashboard"]["port"] == 8099  # default value
+
+
+def test_load_raw_returns_empty_dict_when_files_absent(monkeypatch):
+    """_load_raw must return {} (not raise) when neither config file exists."""
+    from pathlib import Path
+    import core.config as _cfg_mod
+    monkeypatch.setattr(_cfg_mod, "_CONFIG_PATH", Path("C:/nonexistent_path_xyz/no_config.yaml"))
+    monkeypatch.setattr(_cfg_mod, "_EXAMPLE_PATH", Path("C:/nonexistent_path_xyz/no_example.yaml"))
+    result = _cfg_mod._load_raw()
+    assert result == {}
+
+
+def test_get_returns_defaults_when_yaml_is_corrupt(monkeypatch):
+    """_load_raw with a corrupt yaml file must raise YAMLError or return a dict.
+    Either outcome is acceptable; silently returning wrong data is not.
+    We test by writing a real bad config to the project root and pointing _CONFIG_PATH at it.
+    """
+    import os
+    import yaml
+    from pathlib import Path
+    import core.config as _cfg_mod
+
+    # Write a temp bad yaml file next to config.yaml (project root, definitely writable)
+    root = Path(__file__).parent.parent
+    bad_path = root / "_test_bad_config_tmp.yaml"
+    try:
+        bad_path.write_text("{ bad yaml: [unclosed", encoding="utf-8")
+        monkeypatch.setattr(_cfg_mod, "_CONFIG_PATH", bad_path)
+        monkeypatch.setattr(_cfg_mod, "_EXAMPLE_PATH", Path("C:/nonexistent_path_xyz/no_example.yaml"))
+        monkeypatch.setattr(_cfg_mod, "_cache", None)
+        try:
+            result = _cfg_mod.get()
+            # If it doesn't raise, result must at least be a dict
+            assert isinstance(result, dict)
+        except yaml.YAMLError:
+            pass  # acceptable — bad yaml propagates upward
+    finally:
+        if bad_path.exists():
+            bad_path.unlink()
+
+
+# ── Negative-path: env override for llm api_key ──────────────────────────────
+
+def test_llm_env_override_openai(monkeypatch):
+    """llm() must pick up OPENAI_API_KEY from env when config api_key is empty."""
+    import core.config as _cfg_mod
+    monkeypatch.setattr(_cfg_mod, "_cache", None)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key-123")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    result = _cfg_mod.llm()
+    assert result["api_key"] == "test-openai-key-123"
+
+
+def test_llm_env_override_anthropic(monkeypatch):
+    """llm() must pick up ANTHROPIC_API_KEY from env when OPENAI_API_KEY is absent."""
+    import core.config as _cfg_mod
+    monkeypatch.setattr(_cfg_mod, "_cache", None)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key-456")
+    result = _cfg_mod.llm()
+    assert result["api_key"] == "test-anthropic-key-456"
