@@ -25,6 +25,9 @@ from core.auth import require_token, generate_token, print_startup_token, issue_
 from core.audit import log_action
 from core.pid_guard import pid_guard
 from core.key_monitor import check_all_keys, refresh_provider
+from core.session_monitor import scan_sessions
+from core.memoryweb_monitor import get_status as mw_status
+from core.bpc_monitor import get_governance
 from daemon.monitor import daemon, alert_history
 from agents.ollama import get_agent
 from fixers.process_fixer import ProcessFixer
@@ -147,6 +150,26 @@ def api_key_refresh(provider_id: str):
     if result is None:
         return jsonify({"error": f"Unknown provider: {provider_id}"}), 404
     return jsonify(result)
+
+
+@app.route("/api/sessions")
+def api_sessions():
+    """Claude Code context-burn metrics for active sessions."""
+    return jsonify(scan_sessions())
+
+
+@app.route("/api/memoryweb")
+def api_memoryweb():
+    """MemoryWeb health status."""
+    force = request.args.get("refresh") == "1"
+    return jsonify(mw_status(force=force))
+
+
+@app.route("/api/governance")
+def api_governance():
+    """BPC/TSK governance events and anomaly state."""
+    force = request.args.get("refresh") == "1"
+    return jsonify(get_governance(force=force))
 
 
 @app.route("/api/diagnose", methods=["POST"])
@@ -636,6 +659,31 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
 .ks-error{color:var(--orange)}
 .key-cost{font-size:11px;color:var(--cyan);margin-top:4px}
 .key-actions{display:flex;gap:6px;margin-top:8px}
+/* Session monitor */
+.sess-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--border)}
+.sess-row:last-child{border-bottom:none}
+.sess-slug{font-size:12px;font-weight:600;flex:0 0 180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sess-bar-wrap{flex:1;height:8px;background:var(--surface2);border-radius:4px;overflow:hidden}
+.sess-bar{height:100%;border-radius:4px;transition:width .3s}
+.sess-bar.ok{background:var(--green)}
+.sess-bar.warn{background:var(--yellow)}
+.sess-bar.crit{background:var(--red)}
+.sess-pct{font-size:11px;font-weight:700;flex:0 0 38px;text-align:right}
+.sess-burn{font-size:10px;color:var(--muted);flex:0 0 90px;text-align:right}
+/* MemoryWeb */
+.mw-stat{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px}
+.mw-stat:last-child{border-bottom:none}
+.mw-val{font-weight:600;color:var(--cyan)}
+/* Governance */
+.gov-ev{padding:5px 0;border-bottom:1px solid var(--border);font-size:11px}
+.gov-ev:last-child{border-bottom:none}
+.gov-sev-CRITICAL{color:var(--red);font-weight:700}
+.gov-sev-HIGH{color:var(--orange);font-weight:700}
+.gov-sev-warn{color:var(--yellow)}
+.gov-sev-info{color:var(--muted)}
+.gov-action{font-weight:600;margin-right:4px}
+.gov-pair{font-family:monospace;font-size:10px;color:var(--muted)}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
 </style>
 </head>
 <body>
@@ -705,6 +753,33 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
     </div>
     <div id="keys-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
     <div style="font-size:10px;color:var(--muted);margin-top:10px">Keys read from environment variables. Only last 4 chars shown. Cost data requires admin key env var (ANTHROPIC_ADMIN_KEY / OPENAI_ADMIN_KEY). Cached 5 min.</div>
+  </div>
+
+  <!-- Claude Code Sessions -->
+  <div class="card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Claude Code Sessions — Context Burn</span>
+      <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchSessions()">Refresh</button>
+    </div>
+    <div id="sessions-list"></div>
+  </div>
+
+  <!-- MemoryWeb + BPC/TSK row -->
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+        <span>MemoryWeb</span>
+        <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchMemoryWeb(true)">Refresh</button>
+      </div>
+      <div id="mw-panel"></div>
+    </div>
+    <div class="card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+        <span>BPC / TSK Governance</span>
+        <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchGovernance(true)">Refresh</button>
+      </div>
+      <div id="gov-panel"></div>
+    </div>
   </div>
 
   <!-- Bottom row -->
@@ -1081,6 +1156,108 @@ function fetchKeys(){
 // Load keys on startup and every 5 minutes
 fetchKeys();
 setInterval(fetchKeys, 300*1000);
+
+// ── Claude Code Sessions ──────────────────────────────────────────────────────
+function renderSessions(list){
+  const el=document.getElementById('sessions-list');
+  if(!list||!list.length){
+    el.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px 0">No active sessions in last 24h</div>';return;
+  }
+  el.innerHTML=list.map(s=>{
+    const pct=s.utilization_pct||0;
+    const cls=pct>=95?'crit':pct>=85?'warn':'ok';
+    const pctColor=pct>=95?'var(--red)':pct>=85?'var(--yellow)':'var(--green)';
+    const slug=(s.slug||s.session_id||'?').replace(/^C--Users-techai--?/,'').slice(-32);
+    const burn=s.burn_rate_tpm>0?`${Math.round(s.burn_rate_tpm)} tok/min`:'';
+    const age=s.last_activity_ts?(()=>{const d=(Date.now()/1000)-s.last_activity_ts;return d<120?'just now':d<3600?Math.round(d/60)+'m ago':Math.round(d/3600)+'h ago';})():'';
+    return`<div class="sess-row" title="Session: ${esc(s.session_id)}\nTurns: ${s.turn_count||0}\nOutput: ${(s.output_tokens_total||0).toLocaleString()} tokens">
+      <div class="sess-slug" title="${esc(s.slug||'')}${age?' · '+age:''}">${esc(slug)}</div>
+      <div class="sess-bar-wrap"><div class="sess-bar ${cls}" style="width:${pct}%"></div></div>
+      <div class="sess-pct" style="color:${pctColor}">${pct}%</div>
+      <div class="sess-burn">${burn}${age&&!burn?' '+age:''}</div>
+    </div>`;
+  }).join('');
+}
+function fetchSessions(){
+  fetch('/api/sessions').then(r=>r.json()).then(renderSessions).catch(e=>console.error(e));
+}
+fetchSessions();
+setInterval(fetchSessions, 30*1000);  // refresh every 30 s
+
+// ── MemoryWeb ─────────────────────────────────────────────────────────────────
+function renderMemoryWeb(d){
+  const el=document.getElementById('mw-panel');
+  if(!d){el.innerHTML='<div style="color:var(--muted);font-size:12px">Loading...</div>';return;}
+  const dot=d.connected?'<span style="color:var(--green)">●</span>':'<span style="color:var(--red)">●</span>';
+  const rows=[
+    ['Status', dot+' '+(d.status||'unknown')],
+    ['Memories', d.memory_count!=null?d.memory_count.toLocaleString():'—'],
+    ['Embedding coverage', d.embedding_coverage_pct!=null?d.embedding_coverage_pct+'%':'—'],
+    ['Search latency', d.search_latency_ms!=null?d.search_latency_ms+'ms':'—'],
+    ['Last ingestion', d.last_ingestion||'—'],
+    ['Checked', d.checked_at||'—'],
+    ['URL', d.url||'—'],
+  ];
+  if(!d.connected&&d.error) rows.splice(1,0,['Error',`<span style="color:var(--red);font-size:10px">${esc(d.error)}</span>`]);
+  el.innerHTML=rows.map(([k,v])=>`<div class="mw-stat"><span style="color:var(--muted)">${k}</span><span class="mw-val">${v}</span></div>`).join('');
+}
+function fetchMemoryWeb(force){
+  const url='/api/memoryweb'+(force?'?refresh=1':'');
+  fetch(url).then(r=>r.json()).then(renderMemoryWeb).catch(e=>console.error(e));
+}
+fetchMemoryWeb(false);
+setInterval(()=>fetchMemoryWeb(false), 60*1000);
+
+// ── BPC/TSK Governance ────────────────────────────────────────────────────────
+function renderGovernance(d){
+  const el=document.getElementById('gov-panel');
+  if(!d){el.innerHTML='<div style="color:var(--muted);font-size:12px">Loading...</div>';return;}
+  let html='';
+  const bpc=d.bpc||{};
+  if(!bpc.connected){
+    html+=`<div style="font-size:11px;color:var(--muted);margin-bottom:8px">BPC: ${esc(bpc.error||'not configured')}</div>`;
+  } else {
+    const chain=bpc.chain_head_seq!=null?`Chain #${bpc.chain_head_seq} · ${bpc.chain_head_hash||''}`:'-';
+    html+=`<div style="font-size:10px;color:var(--cyan);margin-bottom:6px">BPC chain: ${esc(chain)} · checked ${esc(d.checked_at||'')}</div>`;
+    const evs=bpc.events||[];
+    if(evs.length){
+      html+=evs.slice(0,8).map(e=>{
+        const sev=e.severity||'info';
+        const ts=e.timestamp?(e.timestamp+'').slice(0,19):'';
+        return`<div class="gov-ev"><span class="gov-sev-${sev}">[${sev.toUpperCase()}]</span> <span class="gov-action">${esc(e.action||'')}</span><span class="gov-pair">${esc(e.pair_id||'')} ${e.ip?'· '+e.ip:''}</span><span style="float:right;color:var(--muted);font-size:9px">${ts}</span></div>`;
+      }).join('');
+    } else {
+      html+='<div style="font-size:11px;color:var(--muted)">No BPC events yet</div>';
+    }
+  }
+  const tsk=(d.tsk||{}).anomaly||{};
+  html+='<div class="sep"></div>';
+  if(!tsk.connected){
+    html+=`<div style="font-size:11px;color:var(--muted)">TSK: ${esc(tsk.error||'not connected (localhost:3200)')}</div>`;
+  } else {
+    const scores=tsk.scores||{};
+    const clients=Object.keys(scores);
+    const attacks=clients.filter(c=>scores[c]&&scores[c].verdict==='attack').length;
+    const suspicious=clients.filter(c=>scores[c]&&scores[c].verdict==='suspicious').length;
+    html+=`<div style="font-size:11px"><span style="color:var(--cyan)">TSK</span> · ${clients.length} clients`;
+    if(attacks) html+=` · <span style="color:var(--red);font-weight:700">${attacks} ATTACK</span>`;
+    if(suspicious) html+=` · <span style="color:var(--orange)">${suspicious} suspicious</span>`;
+    html+='</div>';
+    if(attacks||suspicious){
+      clients.filter(c=>scores[c]&&scores[c].verdict!=='clean').slice(0,4).forEach(c=>{
+        const s=scores[c];
+        html+=`<div class="gov-ev"><span class="gov-sev-${s.verdict==='attack'?'CRITICAL':'HIGH'}">[${(s.verdict||'?').toUpperCase()}]</span> ${esc(c)} score=${s.score||0}</div>`;
+      });
+    }
+  }
+  el.innerHTML=html;
+}
+function fetchGovernance(force){
+  const url='/api/governance'+(force?'?refresh=1':'');
+  fetch(url).then(r=>r.json()).then(renderGovernance).catch(e=>console.error(e));
+}
+fetchGovernance(false);
+setInterval(()=>fetchGovernance(false), 30*1000);
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 function fetchStatus(){

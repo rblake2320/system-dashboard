@@ -102,3 +102,26 @@ known_ips: {}
 # known_ips:
 #   "192.168.1.50": "Home NAS"
 #   "10.0.0.2": "GPU Server"
+
+# MemoryWeb knowledge-base health monitor.
+memoryweb:
+  url: "http://localhost:8100"     # local MemoryWeb API (NSSM service)
+  # fallback: "https://memoryweb.ultrarag.app"
+
+# BPC/TSK governance panel.
+# BPC events come from the bpc_audit PostgreSQL table.
+# TSK anomaly state comes from the TSK demo server at localhost:3200.
+governance:
+  # PostgreSQL DSN for the BPC audit table.
+  # Leave empty to disable BPC (panel shows "not configured").
+  bpc_pg_dsn: ""
+  # Example (Windows PG on port 5434):
+  # bpc_pg_dsn: "host=localhost port=5434 dbname=bpc user=postgres password=secret"
+
+  # TSK demo server base URL (default: localhost:3200)
+  tsk_url: "http://localhost:3200"
+
+  # Path to TSK analytics NDJSON event log (relative or absolute)
+  tsk_ndjson: ""
+  # Example:
+  # tsk_ndjson: "C:/Users/techai/tsk-protocol/demo/analytics.ndjson"
