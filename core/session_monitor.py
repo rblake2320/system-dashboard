@@ -143,7 +143,6 @@ def _maybe_log_thresholds(session: dict) -> None:
             _LOGGED.add(key)
             severity = "critical" if threshold >= 95 else ("warning" if threshold >= 85 else "info")
             log_action(
-                "session_monitor",
                 "context_threshold_crossed",
                 {
                     "session_id": sid,
@@ -156,6 +155,8 @@ def _maybe_log_thresholds(session: dict) -> None:
                     "severity": severity,
                     "compaction_likely": pct >= 95,
                 },
+                "",
+                f"threshold_{threshold}pct_crossed",
             )
         elif pct < threshold and key in _LOGGED:
             # New session (context reset) — clear the logged set so it fires again

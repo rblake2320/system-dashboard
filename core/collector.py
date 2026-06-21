@@ -12,17 +12,47 @@ import psutil
 
 from . import config as cfg
 
+# CPU% cache — updated every 2s by a background thread using interval=1 (blocking).
+# cpu_percent(interval=None) returns 0.0 on the first call in a process; this
+# background sampler ensures get_system_metrics() always reads a real value.
+import threading as _cpu_th
+
+_cpu_pct_cache: float = 0.0
+_cpu_pct_ready: bool = False
+
+
+def _cpu_sampler_thread() -> None:
+    global _cpu_pct_cache, _cpu_pct_ready
+    while True:
+        try:
+            val = psutil.cpu_percent(interval=1)  # blocks 1s, returns real value
+            _cpu_pct_cache = round(val, 1)
+            _cpu_pct_ready = True
+        except Exception:
+            pass
+        time.sleep(1)  # sample every ~2s total
+
+
+_cpu_th.Thread(target=_cpu_sampler_thread, daemon=True, name="cpu-sampler").start()
+
 # ── SMART / NVMe health ───────────────────────────────────────────────────────
 
 _CREATE_NO_WINDOW = 0x08000000
 
 
 def _run_ps(command: str, timeout: int = 3) -> str | None:
-    """Run a PowerShell command and return stdout, or None on failure."""
+    """Run a PowerShell command and return stdout, or None on failure.
+
+    Uses -EncodedCommand (Base64 UTF-16-LE) instead of -Command so that
+    subprocess.list2cmdline() double-quoting never expands $_ or other
+    PowerShell automatic variables before the script block executes.
+    """
+    import base64 as _b64
     flags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
+        encoded = _b64.b64encode(command.encode("utf-16-le")).decode("ascii")
         result = subprocess.run(
-            ["powershell", "-NonInteractive", "-Command", command],
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
             capture_output=True, text=True, timeout=timeout,
             creationflags=flags,
         )
@@ -53,9 +83,10 @@ def _ps_get_physical_disks() -> list[dict]:
 def _ps_get_reliability_counters(disk_list: list[dict]) -> list[dict]:
     """Return reliability counters for all physical disks."""
     raw = _run_ps(
-        "Get-StorageReliabilityCounter -PhysicalDisk (Get-PhysicalDisk) | "
+        "Get-PhysicalDisk | ForEach-Object { Get-StorageReliabilityCounter -PhysicalDisk $_ } | "
         "Select-Object DeviceId,Temperature,ReadErrorsTotal,WriteErrorsTotal,Wear | "
-        "ConvertTo-Json"
+        "ConvertTo-Json",
+        timeout=8,
     )
     if not raw:
         return []
@@ -71,7 +102,7 @@ def _ps_get_reliability_counters(disk_list: list[dict]) -> list[dict]:
 def _ps_drive_letter_map() -> dict[str, str]:
     """Return mapping of DeviceId → drive letter(s) via Get-Partition."""
     raw = _run_ps(
-        "Get-Partition | Where-Object {$_.DriveLetter} | "
+        "Get-Partition | Where-Object DriveLetter -ne $null | "
         "Select-Object DiskNumber,DriveLetter | ConvertTo-Json"
     )
     if not raw:
@@ -328,38 +359,105 @@ def _gpu_metrics() -> list[dict]:
         return []
 
 
+# ── NTFS health cache — scanned in background thread, never blocks a tick ──────
+
+import threading as _threading
+import json as _json
+
+_ntfs_auto_failing: set[str] = set()
+_ntfs_cache_ts: float = 0.0
+_NTFS_REFRESH_S: int = 300  # rescan every 5 minutes
+
+
+def _refresh_ntfs_cache() -> None:
+    global _ntfs_auto_failing, _ntfs_cache_ts
+    if sys.platform != "win32":
+        return
+    try:
+        ps_cmd = (
+            "$cutoff=[DateTime]::UtcNow.AddHours(-6);"
+            "$evts=Get-WinEvent -LogName System -ErrorAction SilentlyContinue"
+            " | Where-Object {$_.TimeCreated.ToUniversalTime() -gt $cutoff"
+            " -and $_.ProviderName -eq 'Microsoft-Windows-Ntfs'"
+            " -and ($_.Id -eq 50 -or $_.Id -eq 140)};"
+            "$evts | ForEach-Object {$_.Message} | Select-String -Pattern 'VolumeId: ([A-Z]):'"
+            " | ForEach-Object {$_.Matches[0].Groups[1].Value} | Sort-Object -Unique"
+            " | ConvertTo-Json -Compress"
+        )
+        raw = _run_ps(ps_cmd, timeout=12)  # background thread — can take longer
+        result: set[str] = set()
+        if raw:
+            parsed = _json.loads(raw.strip())
+            if isinstance(parsed, str):
+                result.add(parsed)
+            elif isinstance(parsed, list):
+                result.update(parsed)
+        _ntfs_auto_failing = result
+    except Exception:
+        pass
+    finally:
+        _ntfs_cache_ts = time.time()
+
+
+def _start_ntfs_watcher() -> None:
+    """Daemon thread that refreshes NTFS health cache every 5 minutes."""
+    def _loop() -> None:
+        while True:
+            _refresh_ntfs_cache()
+            time.sleep(_NTFS_REFRESH_S)
+    t = _threading.Thread(target=_loop, daemon=True, name="ntfs-watcher")
+    t.start()
+
+
+_start_ntfs_watcher()  # start immediately at import time
+
+from . import net_monitor as _net
+_net.start_watcher()  # start network health watcher
+from . import fleet_registry as _fleet
+_fleet.start_watcher()
+
+
 # ── System ────────────────────────────────────────────────────────────────────
 
 def get_system_metrics() -> dict:
-    # Non-blocking CPU% — prime on first call, return cached on subsequent calls
-    cpu = psutil.cpu_percent(interval=None)
+    # Read from background sampler — never 0.0 due to cold-start issue
+    cpu = _cpu_pct_cache
     vm = psutil.virtual_memory()
 
     stor = cfg.storage()
-    failing = set(stor.get("failing_drives", []))
+    forced_failing = set(stor.get("failing_drives", []))  # manual override only
     warn_free = stor.get("warn_free_gb_below", 10.0)
+
+    # NTFS auto-failing comes from the background watcher — zero cost here
+    auto_failing = _ntfs_auto_failing
+
     drives: dict[str, dict] = {}
     for letter in stor.get("drives", ["C", "D"]):
         path = f"{letter}:\\"
+        is_failing = letter in forced_failing or letter in auto_failing
         try:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(psutil.disk_usage, path)
                 try:
                     du = fut.result(timeout=1.5)  # 1.5s max per drive (D: can be slow)
+                    if du.total < 50 * 1024 * 1024:
+                        # Total < 50 MB = USB microcontroller or SD stub — skip silently
+                        continue
                     free_gb = round(du.free / 1e9, 1)
                     drives[letter] = {
                         "total_gb": round(du.total / 1e9, 1),
                         "used_gb": round(du.used / 1e9, 1),
                         "free_gb": free_gb,
                         "pct": du.percent,
-                        "failing": letter in failing,
-                        "warn": free_gb < warn_free or letter in failing,
+                        "failing": is_failing,
+                        "failing_reason": ("ntfs_events_6h" if letter in auto_failing else ("config_override" if letter in forced_failing else None)),
+                        "warn": free_gb < warn_free or is_failing,
                     }
                 except Exception:
                     drives[letter] = {
                         "total_gb": 0, "used_gb": 0, "free_gb": 0, "pct": 0,
-                        "failing": letter in failing, "warn": True,
+                        "failing": True, "failing_reason": "mount_error", "warn": False,
                     }
         except (PermissionError, FileNotFoundError, OSError):
             pass
@@ -598,6 +696,7 @@ def build_snapshot() -> dict:
         "processes": get_processes(),
         "ports": {str(k): v for k, v in get_port_status().items()},
         "network": get_network_connections(),
+        "net_health": _net.get_network_health(),
         "hooks": get_hook_status(),
         "projects": get_project_status(),
         "smart_health": get_smart_health(),

@@ -7,7 +7,69 @@ import threading
 import urllib.request
 import urllib.error
 import json
+from pathlib import Path
 from typing import Any
+
+# ── Local .env.local loader ───────────────────────────────────────────────────
+
+_ENV_LOCAL = Path(__file__).resolve().parent.parent / ".env.local"
+
+
+def _load_env_local() -> None:
+    """Load .env.local into os.environ. .env.local always wins — it is the dashboard's key store."""
+    if not _ENV_LOCAL.exists():
+        return
+    for line in _ENV_LOCAL.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k:
+            os.environ[k] = v  # always restore dashboard-stored keys on startup
+
+
+def set_provider_key(provider_id: str, env_var: str, key_value: str) -> None:
+    """Persist a key to .env.local, update os.environ, and bust the cache."""
+    lines: list[str] = []
+    if _ENV_LOCAL.exists():
+        lines = _ENV_LOCAL.read_text(encoding="utf-8").splitlines()
+
+    # Replace or append the env var line
+    new_line = f'{env_var}="{key_value}"'
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{env_var}=") or line.startswith(f"{env_var} ="):
+            lines[i] = new_line
+            replaced = True
+            break
+    if not replaced:
+        lines.append(new_line)
+
+    # Write atomically: temp file → rename, so a crash never leaves a truncated .env.local
+    _tmp = _ENV_LOCAL.with_suffix(".env.local.tmp")
+    _tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _tmp.replace(_ENV_LOCAL)
+    os.environ[env_var] = key_value  # live update without restart
+    _cache._ts = 0  # bust cache so next check_all_keys() reruns
+
+
+def clear_provider_key(provider_id: str, env_var: str) -> None:
+    """Remove a key from .env.local and os.environ."""
+    if _ENV_LOCAL.exists():
+        lines = [
+            l for l in _ENV_LOCAL.read_text(encoding="utf-8").splitlines()
+            if not (l.startswith(f"{env_var}=") or l.startswith(f"{env_var} ="))
+        ]
+        _tmp = _ENV_LOCAL.with_suffix(".env.local.tmp")
+        _tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _tmp.replace(_ENV_LOCAL)
+    os.environ.pop(env_var, None)
+    _cache._ts = 0
+
+
+_load_env_local()  # run at import time
 
 # ── Provider definitions ───────────────────────────────────────────────────────
 
@@ -17,13 +79,21 @@ _PROVIDERS: dict[str, dict] = {
         "env_vars": ["ANTHROPIC_API_KEY"],
         "admin_env_vars": ["ANTHROPIC_ADMIN_KEY"],
         "validate_url": "https://api.anthropic.com/v1/models",
-        "validate_method": "header",       # key in x-api-key header
+        "validate_method": "header",
         "validate_headers": {"anthropic-version": "2023-06-01"},
         "cost_url": "https://api.anthropic.com/v1/organizations/cost_report",
-        "cost_header": "x-api-key",        # admin key goes here
+        "cost_header": "x-api-key",
         "cost_available": True,
         "rotate_url": "https://console.anthropic.com/settings/keys",
         "icon": "A",
+        "models": [
+            {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5 — fast, cheap (chat/quick tasks)"},
+            {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6 — balanced (default)"},
+            {"id": "claude-opus-4-8", "label": "Opus 4.8 — best quality (deep analysis)"},
+            {"id": "claude-fable-5", "label": "Fable 5 — latest"},
+        ],
+        "default_model": "claude-sonnet-4-6",
+        "model_env_var": "ANTHROPIC_MODEL",
     },
     "openai": {
         "label": "OpenAI (GPT)",
@@ -32,20 +102,55 @@ _PROVIDERS: dict[str, dict] = {
         "validate_url": "https://api.openai.com/v1/models",
         "validate_method": "bearer",
         "cost_url": "https://api.openai.com/v1/organization/costs",
-        "cost_header": "Authorization",    # "Bearer <admin_key>"
+        "cost_header": "Authorization",
         "cost_bearer": True,
         "cost_available": True,
         "rotate_url": "https://platform.openai.com/api-keys",
         "icon": "O",
+        "models": [
+            {"id": "gpt-4o-mini", "label": "GPT-4o mini — fast, cheap"},
+            {"id": "gpt-4o", "label": "GPT-4o — balanced"},
+            {"id": "o3-mini", "label": "o3-mini — reasoning"},
+            {"id": "o3", "label": "o3 — best reasoning"},
+        ],
+        "default_model": "gpt-4o-mini",
+        "model_env_var": "OPENAI_MODEL",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "env_vars": ["OPENROUTER_API_KEY"],
+        "validate_url": "https://openrouter.ai/api/v1/models",
+        "validate_method": "bearer",
+        "cost_available": False,
+        "rotate_url": "https://openrouter.ai/keys",
+        "icon": "R",
+        "models": [
+            {"id": "anthropic/claude-3.5-haiku", "label": "Claude 3.5 Haiku (via OR)"},
+            {"id": "anthropic/claude-sonnet-4-5", "label": "Claude Sonnet 4.5 (via OR)"},
+            {"id": "openai/gpt-4o-mini", "label": "GPT-4o mini (via OR)"},
+            {"id": "openai/gpt-4o", "label": "GPT-4o (via OR)"},
+            {"id": "google/gemini-flash-2.0", "label": "Gemini Flash 2.0 (via OR)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct", "label": "Llama 3.3 70B (via OR, free)"},
+            {"id": "deepseek/deepseek-r1", "label": "DeepSeek R1 (via OR)"},
+        ],
+        "default_model": "anthropic/claude-3.5-haiku",
+        "model_env_var": "OPENROUTER_MODEL",
     },
     "gemini": {
         "label": "Google Gemini",
         "env_vars": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         "validate_url": "https://generativelanguage.googleapis.com/v1beta/models",
-        "validate_method": "query",        # key as ?key= param
+        "validate_method": "query",
         "cost_available": False,
         "rotate_url": "https://aistudio.google.com/app/apikey",
         "icon": "G",
+        "models": [
+            {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash — fast"},
+            {"id": "gemini-2.0-flash-thinking-exp", "label": "Gemini 2.0 Flash Thinking"},
+            {"id": "gemini-1.5-pro", "label": "Gemini 1.5 Pro — balanced"},
+        ],
+        "default_model": "gemini-2.0-flash",
+        "model_env_var": "GEMINI_MODEL",
     },
     "groq": {
         "label": "Groq",
@@ -55,16 +160,31 @@ _PROVIDERS: dict[str, dict] = {
         "cost_available": False,
         "rotate_url": "https://console.groq.com/keys",
         "icon": "Q",
+        "models": [
+            {"id": "llama-3.3-70b-versatile", "label": "Llama 3.3 70B — fast & capable"},
+            {"id": "llama-3.1-8b-instant", "label": "Llama 3.1 8B — ultra fast"},
+            {"id": "mixtral-8x7b-32768", "label": "Mixtral 8x7B"},
+            {"id": "gemma2-9b-it", "label": "Gemma 2 9B"},
+        ],
+        "default_model": "llama-3.3-70b-versatile",
+        "model_env_var": "GROQ_MODEL",
     },
     "ollama": {
         "label": "Ollama (local)",
-        "env_vars": [],                    # no key — just health check
+        "env_vars": [],
         "validate_url": "http://localhost:11434/",
         "validate_method": "none",
         "cost_available": False,
         "rotate_url": None,
         "local": True,
         "icon": "L",
+        "models": [
+            {"id": "gemma3:latest", "label": "gemma3 — default (fast)"},
+            {"id": "llama3.1:70b", "label": "llama3.1:70b — large (31s)"},
+            {"id": "deepseek-r1:32b", "label": "deepseek-r1:32b — reasoning"},
+        ],
+        "default_model": "gemma3:latest",
+        "model_env_var": "OLLAMA_MODEL",
     },
 }
 
@@ -245,6 +365,10 @@ def check_all_keys(force: bool = False) -> dict[str, dict]:
             "checked_at": time.strftime("%H:%M:%S"),
             "validation": None,
             "cost": None,
+            "models": pdef.get("models", []),
+            "default_model": pdef.get("default_model", ""),
+            "model_env_var": pdef.get("model_env_var", ""),
+            "selected_model": os.environ.get(pdef.get("model_env_var", ""), pdef.get("default_model", "")),
         }
 
         if is_local:

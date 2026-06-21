@@ -14,3 +14,8 @@ dist/
 build/
 *.egg-info/
 data/
+evidence/
+tests/_tmp/
+_fleet_test.py
+audit_smart.py
+audit_test.py

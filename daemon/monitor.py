@@ -170,11 +170,14 @@ class MonitorDaemon:
             return dict(self._latest_snapshot)
 
     def _run(self) -> None:
+        import concurrent.futures as _cf
         interval = cfg.daemon().get("interval_seconds", 30)
+        tick_timeout = max(20, interval - 5)  # tick must finish before next interval
+
         # Seed rolling history from DB (last 60 points per metric, oldest first)
         for metric_key in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
             rows = db.get_metric_history(metric_key, limit=60)
-            rows.reverse()  # get_metric_history returns newest-first; push oldest first
+            rows.reverse()
             for row in rows:
                 rolling.push(metric_key, row["value"])
 
@@ -183,11 +186,24 @@ class MonitorDaemon:
         self._cpu_sampler.sample(tracked_names)
         time.sleep(1)
 
+        consecutive_failures = 0
         while not self._stop_event.wait(timeout=interval):
             try:
-                self._tick(tracked_names)
+                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(self._tick, tracked_names)
+                    try:
+                        fut.result(timeout=tick_timeout)
+                        consecutive_failures = 0
+                    except _cf.TimeoutError:
+                        print(f"[daemon] tick timed out after {tick_timeout}s — skipping interval")
+                        consecutive_failures += 1
             except Exception as exc:
                 print(f"[daemon] error: {exc}")
+                consecutive_failures += 1
+            if consecutive_failures >= 10:
+                print("[daemon] 10 consecutive failures — resetting sampler state")
+                self._cpu_sampler = _ProcCPUSampler()
+                consecutive_failures = 0
 
     def _tick(self, tracked_names: set[str]) -> None:
         snap = collector.build_snapshot()

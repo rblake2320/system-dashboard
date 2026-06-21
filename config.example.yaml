@@ -110,16 +110,24 @@ memoryweb:
 
 # BPC/TSK governance panel.
 # BPC events come from the bpc_audit PostgreSQL table.
-# TSK anomaly state comes from the TSK demo server at localhost:3200.
+# BPC/TSK governance panel.
 governance:
-  # PostgreSQL DSN for the BPC audit table.
-  # Leave empty to disable BPC (panel shows "not configured").
-  bpc_pg_dsn: ""
-  # Example (Windows PG on port 5434):
-  # bpc_pg_dsn: "host=localhost port=5434 dbname=bpc user=postgres password=secret"
+  # BPC demo server HTTP API.
+  bpc_url: "http://localhost:3100"
+  bpc_admin_token: "demo-admin-token"
+
+  # Optional checkout path used by the dashboard Start BPC Server button.
+  # If empty, the dashboard tries a sibling ../bpc-protocol/demo checkout,
+  # then ~/bpc-protocol/demo.
+  bpc_root: ""
 
   # TSK demo server base URL (default: localhost:3200)
   tsk_url: "http://localhost:3200"
+
+  # Optional checkout path used by the dashboard Start TSK Server button.
+  # If empty, the dashboard tries a sibling ../tsk-protocol checkout,
+  # then ~/tsk-protocol.
+  tsk_root: ""
 
   # Path to TSK analytics NDJSON event log (relative or absolute)
   tsk_ndjson: ""
