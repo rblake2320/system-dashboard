@@ -50,6 +50,9 @@ from core import fleet_registry as _fleet
 from core import fleet_guard as _guard
 from core import fleet_evidence as _evidence
 from core import bpc_audit_chain as _bpc_audit
+from core import bpc_ownership as _bpc_owners
+from core import bpc_secret_vault as _bpc_vault
+from core import governance_profile as _gov_profile
 from core import server_health as _svc_health
 from core.tokens import create_token, list_tokens, validate_token, revoke_token, delete_token, SCOPES as TOKEN_SCOPES
 from daemon.monitor import daemon, alert_history
@@ -389,24 +392,77 @@ def api_governance():
     return jsonify(get_governance(force=force))
 
 
+def _require_governance_enabled():
+    profile = _gov_profile.get_profile()
+    if not _gov_profile.governance_enabled(profile):
+        return jsonify({
+            "error": "BPC/TSK governance is disabled in normal profile",
+            "profile": profile,
+        }), 403
+    return None
+
+
 @app.route("/api/bpc/generate", methods=["POST"])
 def api_bpc_generate():
     """Generate a new BPC keypair, register it, and write a chained audit entry."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     from core import config as cfg
     gov = cfg.get().get("governance", {})
     bpc_url = gov.get("bpc_url", "http://localhost:3100")
+    profile = _gov_profile.get_profile()
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "dashboard-pair").strip()[:64] or "dashboard-pair"
     scope = body.get("scope", "read-write")
     mode = body.get("mode", "development")
+    role = (body.get("role") or "").strip()[:80]
+    machine = (body.get("machine") or "").strip()[:120]
+    birth_id = (body.get("birth_id") or "").strip()[:80]
+    store_in_vault = body.get("store_in_vault", True) is not False
     if scope not in ("read", "read-write", "admin"):
         scope = "read-write"
     if mode not in ("development", "production"):
         mode = "development"
     try:
         result = generate_bpc_pair(bpc_url, name, scope, mode)
+        pair_id = result.get("pairId", "unknown")
+        owner = _bpc_owners.record_owner(
+            pair_id,
+            name=name,
+            role=role,
+            machine=machine,
+            profile=profile,
+            birth_id=birth_id,
+        )
+        result["owner"] = owner
+        vault_result = {"stored": False, "reason": "not_requested"}
+        if store_in_vault:
+            vault_result = _bpc_vault.store_credentials(
+                pair_id,
+                {
+                    "pairId": pair_id,
+                    "privJwk": result.get("privJwk"),
+                    "pubJwk": result.get("pubJwk"),
+                    "rawSecret": result.get("rawSecret"),
+                    "name": name,
+                    "scope": scope,
+                    "mode": mode,
+                    "owner": owner,
+                },
+            )
+        result["vault"] = vault_result
         _bpc_audit.append("generate", result.get("pairId", "unknown"),
-                          metadata={"name": name, "scope": scope, "mode": mode})
+                          metadata={
+                              "name": name,
+                              "scope": scope,
+                              "mode": mode,
+                              "profile": profile,
+                              "role": role,
+                              "machine": machine,
+                              "birth_id": birth_id,
+                              "vault_stored": vault_result.get("stored", False),
+                          })
         return jsonify(result)
     except Exception as exc:
         _error_log.error("BPC generate failed: %s", exc)
@@ -416,6 +472,9 @@ def api_bpc_generate():
 @app.route("/api/bpc/revoke/<pair_id>", methods=["POST"])
 def api_bpc_revoke(pair_id: str):
     """Revoke a BPC pair and write a chained audit entry."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     from core import config as cfg
     gov = cfg.get().get("governance", {})
     bpc_url = gov.get("bpc_url", "http://localhost:3100")
@@ -432,6 +491,9 @@ def api_bpc_rotate(old_pair_id: str):
     The browser builds and signs the RotationRequest using Web Crypto (old privJwk
     never leaves the client). This route validates shape then proxies to BPC.
     """
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     from core import config as cfg
     gov = cfg.get().get("governance", {})
     bpc_url = gov.get("bpc_url", "http://localhost:3100")
@@ -465,6 +527,9 @@ def api_bpc_rotate(old_pair_id: str):
 @app.route("/api/bpc/audit")
 def api_bpc_audit():
     """Return recent hash-chained audit entries and chain integrity check."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     n = int(request.args.get("n", 30))
     entries = _bpc_audit.tail(n)
     integrity = _bpc_audit.verify_chain()
@@ -474,7 +539,16 @@ def api_bpc_audit():
 @app.route("/api/gov/health")
 def api_gov_health():
     """Return PID health for BPC and TSK servers."""
-    return jsonify(_svc_health.get_health())
+    return jsonify({"profile": _gov_profile.summary(), "processes": _svc_health.get_health()})
+
+
+@app.route("/api/bpc/vault/status")
+def api_bpc_vault_status():
+    """Return BPC credential-vault backend status without exposing secrets."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
+    return jsonify(_bpc_vault.status())
 
 
 def _governance_repo_path(config_key: str, *default_parts: str) -> Path:
@@ -496,6 +570,9 @@ def _governance_repo_path(config_key: str, *default_parts: str) -> Path:
 @app.route("/api/bpc/start", methods=["POST"])
 def api_bpc_start():
     """Start the BPC demo server and track its PID."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     bpc_dir = str(_governance_repo_path("bpc_root", "bpc-protocol", "demo"))
     try:
         proc = subprocess.Popen(
@@ -512,6 +589,9 @@ def api_bpc_start():
 @app.route("/api/tsk/start", methods=["POST"])
 def api_tsk_start():
     """Start the TSK demo server and track its PID."""
+    blocked = _require_governance_enabled()
+    if blocked:
+        return blocked
     tsk_dir = str(_governance_repo_path("tsk_root", "tsk-protocol"))
     try:
         proc = subprocess.Popen(
@@ -1338,7 +1418,7 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
       </div>
       <div id="mw-panel"></div>
     </div>
-    <div class="card">
+    <div class="card" id="governance-card">
       <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
         <span>BPC / TSK Governance</span>
         <button class="btn btn-neutral" style="font-size:11px;padding:3px 10px" onclick="fetchGovernance(true)">Refresh</button>
@@ -2130,6 +2210,14 @@ function bpcShowGenModal(){
       <div style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:12px">Generate BPC Keypair</div>
       <div style="margin-bottom:8px"><label style="font-size:11px;color:var(--muted)">Name</label><br>
         <input id="bpc-gen-name" value="dashboard-pair" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;box-sizing:border-box;margin-top:3px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+        <div><label style="font-size:11px;color:var(--muted)">Role</label><br>
+          <input id="bpc-gen-role" placeholder="agent role" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;box-sizing:border-box;margin-top:3px"></div>
+        <div><label style="font-size:11px;color:var(--muted)">Birth ID</label><br>
+          <input id="bpc-gen-birth" placeholder="optional" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;box-sizing:border-box;margin-top:3px"></div>
+      </div>
+      <div style="margin-bottom:8px"><label style="font-size:11px;color:var(--muted)">Machine</label><br>
+        <input id="bpc-gen-machine" placeholder="defaults to local machine" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;box-sizing:border-box;margin-top:3px"></div>
       <div style="margin-bottom:8px"><label style="font-size:11px;color:var(--muted)">Scope</label><br>
         <select id="bpc-gen-scope" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;margin-top:3px">
           <option value="read-write">read-write</option><option value="read">read</option><option value="admin">admin</option>
@@ -2138,6 +2226,9 @@ function bpcShowGenModal(){
         <select id="bpc-gen-mode" style="width:100%;background:#2a2a3e;border:1px solid #444;color:#e2e8f0;padding:4px 8px;border-radius:4px;font-size:12px;margin-top:3px">
           <option value="development">development</option><option value="production">production</option>
         </select></div>
+      <label style="display:flex;gap:6px;align-items:center;margin-bottom:12px;font-size:11px;color:var(--muted)">
+        <input id="bpc-gen-vault" type="checkbox" checked> Store credentials in OS vault when available
+      </label>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-neutral" onclick="document.getElementById('bpc-gen-modal').remove()">Cancel</button>
         <button class="btn btn-primary" onclick="bpcDoGenerate()">Generate</button>
@@ -2156,13 +2247,22 @@ function bpcDoGenerate(){
   const name=document.getElementById('bpc-gen-name').value.trim()||'dashboard-pair';
   const scope=document.getElementById('bpc-gen-scope').value;
   const mode=document.getElementById('bpc-gen-mode').value;
+  const role=document.getElementById('bpc-gen-role').value.trim();
+  const machine=document.getElementById('bpc-gen-machine').value.trim();
+  const birth_id=document.getElementById('bpc-gen-birth').value.trim();
+  const store_in_vault=document.getElementById('bpc-gen-vault').checked;
   const res=document.getElementById('bpc-gen-result');
   res.style.display='block'; res.innerHTML='<div style="color:var(--muted);font-size:11px">Generating...</div>';
-  fetch('/api/bpc/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scope,mode})})
+  fetch('/api/bpc/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,scope,mode,role,machine,birth_id,store_in_vault})})
     .then(r=>r.json())
     .then(data=>{
       if(data.error){res.innerHTML=`<div style="color:var(--red);font-size:11px">Error: ${esc(data.error)}</div>`;return;}
+      const vault=data.vault||{};
+      const vaultMsg=vault.stored
+        ? '<div style="font-size:10px;color:var(--green);margin-bottom:4px">Stored in OS vault.</div>'
+        : `<div style="font-size:10px;color:var(--orange);margin-bottom:4px">Vault not used: ${esc(vault.reason||'unavailable')}</div>`;
       res.innerHTML=`<div style="font-size:11px;color:var(--green);margin-bottom:6px">Pair registered: <b>${esc(data.pairId)}</b></div>
+        ${vaultMsg}
         <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Copy and store the private credentials — they are shown only once:</div>
         <textarea readonly style="width:100%;height:90px;background:#0d0d1a;border:1px solid #444;color:#a0a0c0;font-size:9px;padding:4px;border-radius:4px;box-sizing:border-box">${esc(JSON.stringify({pairId:data.pairId,rawSecret:data.rawSecret,privJwk:data.privJwk,scope:data.scope,mode:data.mode},null,2))}</textarea>
         <button class="btn btn-neutral" style="margin-top:6px;font-size:10px" onclick="document.getElementById('bpc-gen-modal').remove();fetchGovernance(true)">Close &amp; Refresh</button>`;
@@ -2277,6 +2377,7 @@ function fetchSvcHealth(){
 function renderSvcHealth(h){
   const el=document.getElementById('svc-health-row');
   if(!el||!h) return;
+  const procs=h.processes||h;
   const fmt=s=>{
     const status=s.status||'unknown';
     const pid=s.pid?`PID ${s.pid}`:'no pid';
@@ -2285,16 +2386,25 @@ function renderSvcHealth(h){
     const col=status==='running'?'var(--green)':status==='crashed'?'var(--red)':'var(--muted)';
     return `<span style="color:${col};font-weight:700">${status.toUpperCase()}</span> <span style="color:var(--muted);font-size:10px">${pid}${since?' since '+since:''}${crashed}</span>`;
   };
-  el.innerHTML=`<span style="font-size:10px;color:var(--muted)">BPC proc: ${fmt(h.bpc||{})} &nbsp;|&nbsp; TSK proc: ${fmt(h.tsk||{})}</span>`;
+  el.innerHTML=`<span style="font-size:10px;color:var(--muted)">BPC proc: ${fmt(procs.bpc||{})} &nbsp;|&nbsp; TSK proc: ${fmt(procs.tsk||{})}</span>`;
 }
 fetchSvcHealth();
 setInterval(fetchSvcHealth, 10*1000);
 
 function renderGovernance(d){
   _govLastData=d;
+  const card=document.getElementById('governance-card');
   const el=document.getElementById('gov-panel');
   if(!d){el.innerHTML='<div style="color:var(--muted);font-size:12px">Loading...</div>';return;}
+  if(d.enabled===false){
+    if(card) card.style.display='none';
+    el.innerHTML='';
+    return;
+  }
+  if(card) card.style.display='';
   let html='';
+  const profile=d.profile||'enterprise';
+  html+=`<div style="font-size:10px;color:var(--muted);margin-bottom:7px">Profile: <span style="color:${profile==='government'?'var(--orange)':'var(--cyan)'};font-weight:700">${esc(profile.toUpperCase())}</span>${profile==='government'?' · government gates visible':''}</div>`;
 
   // ── BPC section ──────────────────────────────────────────────────────────
   const bpc=d.bpc||{};
@@ -2317,13 +2427,16 @@ function renderGovernance(d){
     const pairs=(bpc.pairs||[]).slice(0,12);
     if(pairs.length){
       html+=`<table style="width:100%;font-size:10px;border-collapse:collapse;margin-bottom:6px">
-        <tr style="color:var(--muted)"><th style="text-align:left;padding:2px 3px">Pair ID</th><th>Name</th><th>Scope</th><th>Status</th><th>Reqs</th><th></th></tr>`;
+        <tr style="color:var(--muted)"><th style="text-align:left;padding:2px 3px">Pair ID</th><th>Owner</th><th>Scope</th><th>Status</th><th>Reqs</th><th></th></tr>`;
       pairs.forEach(p=>{
         const stCol=p.status==='active'?'var(--green)':p.status==='revoked'?'var(--red)':p.status==='rotated'?'var(--orange)':'var(--muted)';
         const pid=esc(p.id||'');
+        const owner=p.owner||{};
+        const ownerLabel=owner.role||p.name||owner.name||'';
+        const ownerSub=[owner.profile, owner.machine, owner.birth_id].filter(Boolean).join(' · ');
         html+=`<tr style="border-top:1px solid #2a2a3e">
           <td style="padding:2px 3px;font-family:monospace;color:var(--cyan);font-size:9px">${esc((p.id||'').slice(0,16)+'…')}</td>
-          <td style="padding:2px 3px;color:var(--muted)">${esc(p.name||'')}</td>
+          <td style="padding:2px 3px;color:var(--muted)">${esc(ownerLabel)}${ownerSub?`<br><span style="font-size:8px;color:#666">${esc(ownerSub)}</span>`:''}</td>
           <td style="padding:2px 3px;color:var(--muted)">${esc(p.scope||'')}</td>
           <td style="padding:2px 3px;color:${stCol}">${esc(p.status||'?')}</td>
           <td style="padding:2px 3px;color:var(--muted);text-align:right">${p.requests||0}</td>

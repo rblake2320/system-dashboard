@@ -109,12 +109,18 @@ memoryweb:
   # fallback: "https://memoryweb.ultrarag.app"
 
 # BPC/TSK governance panel.
-# BPC events come from the bpc_audit PostgreSQL table.
-# BPC/TSK governance panel.
 governance:
+  # normal: hide governance controls.
+  # enterprise: show BPC/TSK controls.
+  # government: show BPC/TSK plus government-only gates as they are wired.
+  profile: "normal"
+
   # BPC demo server HTTP API.
   bpc_url: "http://localhost:3100"
   bpc_admin_token: "demo-admin-token"
+
+  # Store generated BPC credentials in OS credential manager when available.
+  bpc_vault_backend: "keyring"
 
   # Optional checkout path used by the dashboard Start BPC Server button.
   # If empty, the dashboard tries a sibling ../bpc-protocol/demo checkout,

@@ -5,6 +5,7 @@ TSK demo server: http://localhost:3200  (cd tsk-protocol   && npx tsx demo/serve
 
 Configure via config.yaml under the `governance:` key:
   governance:
+    profile:         "normal"    # normal | enterprise | government
     bpc_url:         "http://localhost:3100"
     bpc_admin_token: "demo-admin-token"
     bpc_root:        ""          # optional path to bpc-protocol/demo
@@ -56,6 +57,12 @@ def _fetch_bpc(bpc_url: str, admin_token: str) -> dict:
     try:
         pairs_raw = _get(f"{bpc_url}/bpc/pairs", token=admin_token)
         pairs = pairs_raw.get("pairs", []) if isinstance(pairs_raw, dict) else []
+        try:
+            from core.bpc_ownership import annotate_pairs
+
+            pairs = annotate_pairs(pairs)
+        except Exception:
+            pass
     except urllib.error.HTTPError as e:
         return {"connected": False, "error": f"HTTP {e.code} on /bpc/pairs", "pairs": []}
     except Exception as exc:
@@ -223,7 +230,19 @@ def get_governance(force: bool = False) -> dict:
         return _cache
 
     from core import config as cfg
+    from core import governance_profile as profile_cfg
     gov = cfg.get().get("governance", {})
+    profile = profile_cfg.summary(gov.get("profile", "normal"))
+    if not profile["enabled"]:
+        result = {
+            "checked_at": time.strftime("%H:%M:%S"),
+            **profile,
+            "bpc": {"connected": False, "hidden": True, "pairs": []},
+            "tsk": {"anomaly": {"connected": False, "hidden": True}, "recent_events": []},
+        }
+        _cache = result
+        _cache_ts = time.time()
+        return result
 
     bpc_url = gov.get("bpc_url", "http://localhost:3100")
     admin_token = gov.get("bpc_admin_token", "demo-admin-token")
@@ -236,6 +255,7 @@ def get_governance(force: bool = False) -> dict:
 
     result = {
         "checked_at": time.strftime("%H:%M:%S"),
+        **profile,
         "bpc_url": bpc_url,
         "tsk_url": tsk_url,
         "bpc": bpc,
