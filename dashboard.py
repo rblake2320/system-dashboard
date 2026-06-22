@@ -585,13 +585,14 @@ def api_bpc_start():
     if blocked:
         return blocked
     bpc_dir = str(_governance_repo_path("bpc_root", "bpc-protocol", "demo"))
+    bpc_data = str(Path.home() / ".bpc")
     try:
         proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NoExit", "-Command",
-             f"Set-Location '{bpc_dir}'; npx tsx server.ts"],
+             f"$env:BPC_DATA_DIR='{bpc_data}'; Set-Location '{bpc_dir}'; npx tsx server.ts"],
             creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        _svc_health.register("bpc", proc.pid, f"npx tsx server.ts in {bpc_dir}")
+        _svc_health.register("bpc", proc.pid, f"npx tsx server.ts in {bpc_dir} (data: {bpc_data})")
         return jsonify({"started": True, "pid": proc.pid, "dir": bpc_dir})
     except Exception as exc:
         return jsonify({"started": False, "error": str(exc)}), 500
@@ -604,13 +605,14 @@ def api_tsk_start():
     if blocked:
         return blocked
     tsk_dir = str(_governance_repo_path("tsk_root", "tsk-protocol"))
+    tsk_data = str(Path.home() / ".tsk")
     try:
         proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-NoExit", "-Command",
-             f"Set-Location '{tsk_dir}'; npx tsx demo/server.ts"],
+             f"$env:TSK_DATA_DIR='{tsk_data}'; Set-Location '{tsk_dir}'; npx tsx demo/server.ts"],
             creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        _svc_health.register("tsk", proc.pid, f"npx tsx demo/server.ts in {tsk_dir}")
+        _svc_health.register("tsk", proc.pid, f"npx tsx demo/server.ts in {tsk_dir} (data: {tsk_data})")
         return jsonify({"started": True, "pid": proc.pid, "dir": tsk_dir})
     except Exception as exc:
         return jsonify({"started": False, "error": str(exc)}), 500
