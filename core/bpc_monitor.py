@@ -304,7 +304,8 @@ def get_governance(force: bool = False) -> dict:
     from core import config as cfg
     from core import governance_profile as profile_cfg
     gov = cfg.get().get("governance", {})
-    profile = profile_cfg.summary(gov.get("profile", "normal"))
+    # Use get_profile() so session overrides (set via /api/governance/enable) are honoured.
+    profile = profile_cfg.summary(profile_cfg.get_profile())
     if not profile["enabled"]:
         result = {
             "checked_at": time.strftime("%H:%M:%S"),
@@ -342,4 +343,11 @@ def get_governance(force: bool = False) -> dict:
 
     _cache = result
     _cache_ts = time.time()
+
+    try:
+        from core import webhook_notifier as wh
+        wh.notify_governance(result)
+    except Exception:
+        pass
+
     return result

@@ -392,6 +392,17 @@ def api_governance():
     return jsonify(get_governance(force=force))
 
 
+@app.route("/api/governance/enable", methods=["POST"])
+def api_governance_enable():
+    """Switch to enterprise governance mode for this session (no config.yaml change)."""
+    profile = _gov_profile.set_session_profile("enterprise")
+    from core.bpc_monitor import _cache  # bust the governance cache
+    import core.bpc_monitor as _bm
+    _bm._cache = {}
+    _bm._cache_ts = 0.0
+    return jsonify({"ok": True, "profile": profile})
+
+
 def _require_governance_enabled():
     profile = _gov_profile.get_profile()
     if not _gov_profile.governance_enabled(profile):
@@ -2397,8 +2408,12 @@ function renderGovernance(d){
   const el=document.getElementById('gov-panel');
   if(!d){el.innerHTML='<div style="color:var(--muted);font-size:12px">Loading...</div>';return;}
   if(d.enabled===false){
-    if(card) card.style.display='none';
-    el.innerHTML='';
+    if(card) card.style.display='';
+    el.innerHTML=`<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0">
+      <span style="font-size:11px;color:var(--muted)">Credential audit trail — tamper-evident witness chain for BPC/TSK agent credentials.</span>
+      <a href="#" onclick="event.preventDefault();fetch('/api/governance/enable',{method:'POST'}).then(()=>fetchGovernance(true))"
+        style="font-size:11px;color:var(--cyan);white-space:nowrap;margin-left:12px">Switch to Governance mode →</a>
+    </div>`;
     return;
   }
   if(card) card.style.display='';
