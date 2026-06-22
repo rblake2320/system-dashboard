@@ -38,7 +38,9 @@ REPLICA_TOKEN = "a8f3d2e1b4c5f6a7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
 
 WITNESS_URL = f"{VPS_BASE}/witness"
 BPC_REPLICA_URL = f"{VPS_BASE}/bpc/replica"
+BPC_PAIR_URL = f"{VPS_BASE}/bpc/replica/pair"
 TSK_REPLICA_URL = f"{VPS_BASE}/tsk/replica"
+TSK_TUMBLER_URL = f"{VPS_BASE}/tsk/replica/tumbler"
 
 # ---------------------------------------------------------------------------
 # SSL context — self-signed cert on VPS
@@ -202,9 +204,9 @@ class TestWitnessVPS:
         entry_count = 1
         head_hash = _fake_head(self.principal, entry_count)
         ts = _now_iso()
-        bad_sig = _sign_checkpoint(
-            self.principal, head_hash, entry_count, ts
-        ).replace("a", "b")  # corrupt the signature
+        real_sig = _sign_checkpoint(self.principal, head_hash, entry_count, ts)
+        # Flip the last 2 hex chars to guarantee corruption regardless of content
+        bad_sig = real_sig[:-2] + ("00" if real_sig[-2:] != "00" else "ff")
 
         payload = {
             "principal_id": self.principal,
@@ -279,25 +281,34 @@ class TestBPCReplicaVPS:
         )
 
     # -------------------------------------------------------------------
+    def _pair_payload(self, status: str = "active") -> dict:
+        return {
+            "op": "set",
+            "pair": {
+                "id": self.pair_id,
+                "name": "phase5-test-pair",
+                "pubJwk": {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "x": "phase5testx0000000000000000000000000000000A",
+                    "y": "phase5testy0000000000000000000000000000000B",
+                },
+                "secretHash": "abc123def456abc123def456abc123def456abc123def456abc123def456abcd",
+                "status": status,
+                "scope": "read-write",
+                "mode": "development",
+                "created": time.time(),
+                "lastActive": None,
+                "requests": 0,
+                "failedSigs": 0,
+            },
+        }
+
     def test_02_set_pair(self):
         """POST set op → 200 with a real pair record accepted."""
-        payload = {
-            "op": "set",
-            "pairId": self.pair_id,
-            "pubJwk": {
-                "kty": "EC",
-                "crv": "P-256",
-                "x": "phase5testx0000000000000000000000000000000A",
-                "y": "phase5testy0000000000000000000000000000000B",
-            },
-            "secretHash": "abc123def456abc123def456abc123def456abc123def456abc123def456abcd",
-            "status": "active",
-            "scope": "read-write",
-            "mode": "development",
-        }
         status, body = _post(
-            f"{BPC_REPLICA_URL}",
-            payload,
+            f"{BPC_PAIR_URL}",
+            self._pair_payload(),
             headers=_replica_headers(),
         )
         assert status == 200, f"Expected 200, got {status}: {body}"
@@ -308,23 +319,10 @@ class TestBPCReplicaVPS:
     # -------------------------------------------------------------------
     def test_03_idempotent_set(self):
         """Posting the same set op twice must succeed without error (no duplicate fault)."""
-        payload = {
-            "op": "set",
-            "pairId": self.pair_id,
-            "pubJwk": {
-                "kty": "EC",
-                "crv": "P-256",
-                "x": "phase5testx0000000000000000000000000000000A",
-                "y": "phase5testy0000000000000000000000000000000B",
-            },
-            "secretHash": "abc123def456abc123def456abc123def456abc123def456abc123def456abcd",
-            "status": "active",
-            "scope": "read-write",
-            "mode": "development",
-        }
+        payload = self._pair_payload()
         for attempt in (1, 2):
             status, body = _post(
-                f"{BPC_REPLICA_URL}",
+                f"{BPC_PAIR_URL}",
                 payload,
                 headers=_replica_headers(),
             )
@@ -339,22 +337,12 @@ class TestBPCReplicaVPS:
     def test_04_revoke(self):
         """POST set then revoke; health still responds (pair count doesn't crash service)."""
         # Set first.
-        set_payload = {
-            "op": "set",
-            "pairId": self.pair_id,
-            "pubJwk": {"kty": "EC", "crv": "P-256", "x": "X", "y": "Y"},
-            "secretHash": "deadbeef" * 8,
-            "status": "active",
-            "scope": "read-write",
-            "mode": "development",
-        }
-        s1, b1 = _post(f"{BPC_REPLICA_URL}", set_payload, headers=_replica_headers())
+        s1, b1 = _post(f"{BPC_PAIR_URL}", self._pair_payload(), headers=_replica_headers())
         assert s1 == 200, f"set before revoke failed: {s1} {b1}"
 
-        # Revoke.
-        revoke_payload = {"op": "revoke", "pairId": self.pair_id}
-        s2, b2 = _post(f"{BPC_REPLICA_URL}", revoke_payload, headers=_replica_headers())
-        assert s2 == 200, f"revoke failed: {s2} {b2}"
+        # Delete (logical revoke — op "revoke" doesn't exist; use "delete").
+        s2, b2 = _post(f"{BPC_PAIR_URL}", {"op": "delete", "pairId": self.pair_id}, headers=_replica_headers())
+        assert s2 == 200, f"delete/revoke failed: {s2} {b2}"
 
         # Service still healthy after revoke.
         s3, b3 = _get(f"{BPC_REPLICA_URL}/health", headers=_replica_headers())
@@ -366,7 +354,7 @@ class TestBPCReplicaVPS:
         """POST with a wrong x-replica-token header → 401."""
         payload = {"op": "set", "pairId": self.pair_id}
         bad_headers = {"x-replica-token": "wrong-token-" + uuid.uuid4().hex}
-        status, body = _post(f"{BPC_REPLICA_URL}", payload, headers=bad_headers)
+        status, body = _post(f"{BPC_PAIR_URL}", payload, headers=bad_headers)
         assert status == 401, f"Expected 401 for bad token, got {status}: {body}"
 
 
@@ -387,29 +375,15 @@ class TestTSKReplicaVPS:
         return {
             "op": op,
             "clientId": self.client_id,
+            "secretSealed": False,
             "map": {
                 "clientId": self.client_id,
-                "sharedSecret": "",          # must never be stored with real value
-                "keyLength": 32,
-                "segments": [
-                    {
-                        "id": "seg-hotp",
-                        "algorithm": "HOTP",
-                        "counter": 0,
-                        "windowSize": 5,
-                    },
-                    {
-                        "id": "seg-totp",
-                        "algorithm": "TOTP",
-                        "period": 30,
-                        "digits": 6,
-                    },
-                ],
-                "checksum": {"position": [28, 32]},
-                "createdAt": 0,
-                "version": "1",
+                "sharedSecret": "",
+                "segments": {
+                    "seg-hotp": {"algorithm": "HOTP", "counter": 0, "windowSize": 5},
+                    "seg-totp": {"algorithm": "TOTP", "period": 30, "digits": 6},
+                },
             },
-            "secretSealed": False,
         }
 
     # -------------------------------------------------------------------
@@ -430,7 +404,7 @@ class TestTSKReplicaVPS:
         """POST set op with a valid TSK map → 200, no error."""
         payload = self._tsk_map_payload("set")
         status, body = _post(
-            f"{TSK_REPLICA_URL}",
+            f"{TSK_TUMBLER_URL}",
             payload,
             headers=_replica_headers(),
         )
@@ -444,7 +418,7 @@ class TestTSKReplicaVPS:
         """POST updateCounters → 200 after first setting the map."""
         # Ensure map exists.
         s0, b0 = _post(
-            f"{TSK_REPLICA_URL}",
+            f"{TSK_TUMBLER_URL}",
             self._tsk_map_payload("set"),
             headers=_replica_headers(),
         )
@@ -456,7 +430,7 @@ class TestTSKReplicaVPS:
             "updates": [["seg-hotp", 7]],
         }
         status, body = _post(
-            f"{TSK_REPLICA_URL}",
+            f"{TSK_TUMBLER_URL}",
             update_payload,
             headers=_replica_headers(),
         )
@@ -468,7 +442,7 @@ class TestTSKReplicaVPS:
         must return 200, not double-advance the counter."""
         # Set map.
         s0, b0 = _post(
-            f"{TSK_REPLICA_URL}",
+            f"{TSK_TUMBLER_URL}",
             self._tsk_map_payload("set"),
             headers=_replica_headers(),
         )
@@ -480,7 +454,7 @@ class TestTSKReplicaVPS:
             "clientId": self.client_id,
             "updates": [["seg-hotp", 7]],
         }
-        s1, b1 = _post(f"{TSK_REPLICA_URL}", upd_payload, headers=_replica_headers())
+        s1, b1 = _post(f"{TSK_TUMBLER_URL}", upd_payload, headers=_replica_headers())
         assert s1 == 200, f"updateCounters before consume failed: {s1} {b1}"
 
         consume_payload = {
@@ -491,11 +465,11 @@ class TestTSKReplicaVPS:
         }
 
         # First consume.
-        s2, b2 = _post(f"{TSK_REPLICA_URL}", consume_payload, headers=_replica_headers())
+        s2, b2 = _post(f"{TSK_TUMBLER_URL}", consume_payload, headers=_replica_headers())
         assert s2 == 200, f"First consume failed: {s2} {b2}"
 
         # Replay of the same matchedCounter → must be idempotent (200, not 4xx).
-        s3, b3 = _post(f"{TSK_REPLICA_URL}", consume_payload, headers=_replica_headers())
+        s3, b3 = _post(f"{TSK_TUMBLER_URL}", consume_payload, headers=_replica_headers())
         assert s3 == 200, (
             f"Replay consume must be idempotent (200), got {s3}: {b3}"
         )
@@ -505,7 +479,7 @@ class TestTSKReplicaVPS:
         """GET /tsk/replica/maps must not leak sharedSecret in any response field."""
         # Seed a map so there is at least one entry.
         s0, _b0 = _post(
-            f"{TSK_REPLICA_URL}",
+            f"{TSK_TUMBLER_URL}",
             self._tsk_map_payload("set"),
             headers=_replica_headers(),
         )
@@ -552,5 +526,5 @@ class TestTSKReplicaVPS:
             "secretSealed": False,
         }
         bad_headers = {"x-replica-token": "wrong-token-" + uuid.uuid4().hex}
-        status, body = _post(f"{TSK_REPLICA_URL}", payload, headers=bad_headers)
+        status, body = _post(f"{TSK_TUMBLER_URL}", payload, headers=bad_headers)
         assert status == 401, f"Expected 401 for bad token, got {status}: {body}"
