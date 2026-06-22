@@ -12,12 +12,14 @@ Configure via config.yaml under the `governance:` key:
     tsk_url:         "http://localhost:3200"
     tsk_root:        ""          # optional path to tsk-protocol
     tsk_ndjson:      ""          # optional path to analytics.ndjson
+    vps_url:         "https://srv1775625.hstgr.cloud"   # replica + witness VPS
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +32,11 @@ _MAX_EVENTS = 20
 _cache: dict = {}
 _cache_ts: float = 0.0
 
+# SSL context that skips certificate verification for self-signed VPS certs.
+_SSL_NO_VERIFY = ssl.create_default_context()
+_SSL_NO_VERIFY.check_hostname = False
+_SSL_NO_VERIFY.verify_mode = ssl.CERT_NONE
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +45,13 @@ def _get(url: str, token: str | None = None, timeout: int = _TIMEOUT) -> dict | 
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode(errors="replace"))
+
+
+def _get_insecure(url: str, timeout: int = _TIMEOUT) -> dict | list:
+    """GET with SSL certificate verification disabled (for VPS self-signed certs)."""
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_NO_VERIFY) as resp:
         return json.loads(resp.read().decode(errors="replace"))
 
 
@@ -59,7 +73,6 @@ def _fetch_bpc(bpc_url: str, admin_token: str) -> dict:
         pairs = pairs_raw.get("pairs", []) if isinstance(pairs_raw, dict) else []
         try:
             from core.bpc_ownership import annotate_pairs
-
             pairs = annotate_pairs(pairs)
         except Exception:
             pass
@@ -149,6 +162,65 @@ def _resolve_default_tsk_ndjson(gov: dict) -> str:
     return str(candidates[0])
 
 
+# ── VPS replica + witness health ──────────────────────────────────────────────
+
+def _fetch_one_vps_endpoint(url: str) -> dict:
+    """GET a single VPS health endpoint. Returns the parsed JSON body with a
+    'connected' bool added, or an error dict if the request fails."""
+    try:
+        body = _get_insecure(url, timeout=_TIMEOUT)
+        if not isinstance(body, dict):
+            body = {"raw": body}
+        return {"connected": True, **body}
+    except urllib.error.HTTPError as exc:
+        return {"connected": False, "error": f"HTTP {exc.code}"}
+    except Exception as exc:
+        return {"connected": False, "error": str(exc)[:80]}
+
+
+def fetch_vps_health(config: dict) -> dict:
+    """Fetch replica and witness health from the VPS.
+
+    Reads ``vps_url`` from *config* (default ``https://srv1775625.hstgr.cloud``).
+    GETs three endpoints in sequence:
+      - /witness/health      → {"ok": true, "service": "witness", "ts": float}
+      - /bpc/replica/health  → {"ok": true, "service": "bpc-replica", "pairs": N}
+      - /tsk/replica/health  → {"ok": true, "service": "tsk-replica", "maps": N}
+
+    Returns::
+
+        {
+            "connected": bool,          # True when ALL three succeeded
+            "vps_url": str,
+            "witness": {"connected": bool, ...},
+            "bpc_replica": {"connected": bool, ...},
+            "tsk_replica": {"connected": bool, ...},
+        }
+
+    Individual service failures are captured per-key so the dashboard can show
+    partial outages without collapsing the whole VPS block to "down".
+    """
+    vps_url = str(config.get("vps_url", "https://srv1775625.hstgr.cloud")).rstrip("/")
+
+    witness = _fetch_one_vps_endpoint(f"{vps_url}/witness/health")
+    bpc_replica = _fetch_one_vps_endpoint(f"{vps_url}/bpc/replica/health")
+    tsk_replica = _fetch_one_vps_endpoint(f"{vps_url}/tsk/replica/health")
+
+    all_connected = (
+        witness.get("connected", False)
+        and bpc_replica.get("connected", False)
+        and tsk_replica.get("connected", False)
+    )
+
+    return {
+        "connected": all_connected,
+        "vps_url": vps_url,
+        "witness": witness,
+        "bpc_replica": bpc_replica,
+        "tsk_replica": tsk_replica,
+    }
+
+
 # ── Keypair generation ────────────────────────────────────────────────────────
 
 def generate_bpc_pair(bpc_url: str, name: str, scope: str = "read-write",
@@ -223,7 +295,7 @@ def revoke_bpc_pair(bpc_url: str, pair_id: str) -> dict:
 # ── Combined ──────────────────────────────────────────────────────────────────
 
 def get_governance(force: bool = False) -> dict:
-    """Return merged BPC + TSK state. Uses 30s cache."""
+    """Return merged BPC + TSK + VPS replica/witness state. Uses 30s cache."""
     global _cache, _cache_ts
 
     if not force and _cache and (time.time() - _cache_ts) < _CACHE_TTL:
@@ -239,6 +311,7 @@ def get_governance(force: bool = False) -> dict:
             **profile,
             "bpc": {"connected": False, "hidden": True, "pairs": []},
             "tsk": {"anomaly": {"connected": False, "hidden": True}, "recent_events": []},
+            "vps": {"connected": False, "hidden": True},
         }
         _cache = result
         _cache_ts = time.time()
@@ -252,6 +325,7 @@ def get_governance(force: bool = False) -> dict:
     bpc = _fetch_bpc(bpc_url, admin_token)
     tsk_anomaly = _fetch_tsk(tsk_url)
     tsk_events = _parse_tsk_ndjson(tsk_ndjson)
+    vps = fetch_vps_health(gov)
 
     result = {
         "checked_at": time.strftime("%H:%M:%S"),
@@ -263,6 +337,7 @@ def get_governance(force: bool = False) -> dict:
             "anomaly": tsk_anomaly,
             "recent_events": tsk_events,
         },
+        "vps": vps,
     }
 
     _cache = result
