@@ -45,6 +45,23 @@ def _last_hash() -> str:
         return _GENESIS_HASH
 
 
+def head() -> dict:
+    """Return the current chain head hash and total entry count.
+
+    This is what the witness checkpoints: {head_hash, entry_count}. A genesis
+    head (no entries) reports the all-zero hash and count 0.
+    """
+    p = _path()
+    if not p.exists():
+        return {"head_hash": _GENESIS_HASH, "entry_count": 0}
+    count = 0
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                count += 1
+    return {"head_hash": _last_hash(), "entry_count": count}
+
+
 def _compute_hash(
     prev_hash: str,
     ts: str,
