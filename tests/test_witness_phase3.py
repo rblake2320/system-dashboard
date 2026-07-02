@@ -49,20 +49,20 @@ def test_health(witness):
 def test_checkpoint_push_and_identical_verify(isolated, witness):
     chain.append("generate", "pair_a")
     chain.append("rotate", "pair_a")
-    resp = witness_client.push_checkpoint(witness, WKEY, PRINCIPAL)
+    resp = witness_client.push_checkpoint(WKEY, PRINCIPAL, witness_url=witness)
     assert resp["ok"] is True
     assert resp["witnessed"]["entry_count"] == 2
 
-    v = witness_client.verify_against_witness(witness, PRINCIPAL)
+    v = witness_client.verify_against_witness(PRINCIPAL, witness_url=witness)
     assert v["match"] is True
     assert v["reason"] == "identical"
 
 
 def test_local_ahead_is_not_a_mismatch(isolated, witness):
     chain.append("generate", "pair_a")
-    witness_client.push_checkpoint(witness, WKEY, PRINCIPAL)   # witness at count 1
-    chain.append("rotate", "pair_a")                          # local advances to 2
-    v = witness_client.verify_against_witness(witness, PRINCIPAL)
+    witness_client.push_checkpoint(WKEY, PRINCIPAL, witness_url=witness)  # witness at count 1
+    chain.append("rotate", "pair_a")                                       # local advances to 2
+    v = witness_client.verify_against_witness(PRINCIPAL, witness_url=witness)
     assert v["match"] is True
     assert v["reason"] == "local_ahead"
 
@@ -87,7 +87,7 @@ def test_chain_rewrite_triggers_audit_lock(isolated, witness):
     chain.append("generate", "pair_a")
     chain.append("rotate", "pair_a")
     chain.append("revoke", "pair_a")
-    witness_client.push_checkpoint(witness, WKEY, PRINCIPAL)
+    witness_client.push_checkpoint(WKEY, PRINCIPAL, witness_url=witness)
     head_before = chain.head()
     assert head_before["entry_count"] == 3
 
@@ -101,7 +101,7 @@ def test_chain_rewrite_triggers_audit_lock(isolated, witness):
     assert head_after["head_hash"] != head_before["head_hash"]   # rewrite happened
 
     # The witness still holds the original head → mismatch detected.
-    v = witness_client.verify_against_witness(witness, PRINCIPAL)
+    v = witness_client.verify_against_witness(PRINCIPAL, witness_url=witness)
     assert v["match"] is False
     assert v["reason"] == "head_mismatch"
 
@@ -121,6 +121,6 @@ def test_chain_rewrite_triggers_audit_lock(isolated, witness):
 def test_witness_unreachable_is_not_tamper(isolated):
     chain.append("generate", "pair_a")
     # Point at a dead port — must NOT be treated as a mismatch/lock.
-    v = witness_client.verify_against_witness("http://127.0.0.1:1", PRINCIPAL)
+    v = witness_client.verify_against_witness(PRINCIPAL, witness_url="http://127.0.0.1:1")
     assert v["match"] is True
     assert v["reason"].startswith("witness_unreachable")
