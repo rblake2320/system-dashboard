@@ -14,6 +14,8 @@ Real-time ops dashboard for AI-heavy workstations. Monitors CPU, RAM, GPU, stora
 - **Auto-Fix**: SSE-streamed terminal output as fixers run in real time
 - **Alert history**: Full log of every issue ever detected
 - **Kill button**: Per-process kill directly from the process table
+- **Fleet auto-halt governance**: Graduated guard states, integrity-triggered hard stops, evidence capture, and per-agent termination
+- **Provenance record**: Verified June 2026 auto-halt history and comparison with the July 2026 AI Kill Switch Act proposal ([details](docs/ai-kill-switch-provenance.md))
 
 ## Setup
 

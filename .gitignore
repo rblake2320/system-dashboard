@@ -18,6 +18,7 @@ build/
 data/
 evidence/
 tests/_tmp/
+.pytest-*/
 _fleet_test.py
 audit_smart.py
 audit_test.py

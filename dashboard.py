@@ -1280,6 +1280,8 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
     <span>|</span>
     <span>Refresh in <span id="countdown">10</span>s</span>
     <span id="uptime-span"></span>
+    <button class="btn-help" onclick="runSystemReview()" title="Run a fresh system review">Review</button>
+    <button class="btn-help" onclick="exportSystemState()" title="Download current state and issue history">Export</button>
     <button class="btn-help" onclick="openHelp()" title="Dashboard guide &amp; panel descriptions">? Help</button>
   </div>
 </div>
@@ -1869,6 +1871,9 @@ function renderNetHealth(snap){
           const res = (a.status==='done'||a.status==='crashed') && a.result
             ? '<div style="font-size:10px;color:'+c+';margin-top:2px">'+a.result+'</div>'
             : '';
+          const kill = !['done','crashed'].includes(a.status)
+            ? '<button class="btn btn-danger" style="font-size:9px;padding:1px 6px;margin-left:auto" onclick="killFleetAgent(\''+encodeURIComponent(a.name)+'\',\''+sesc(a.name)+'\')">Kill</button>'
+            : '';
           return '<div style="background:#111;border:1px solid '+c+'44;border-radius:6px;padding:9px">'
             +'<div style="display:flex;justify-content:space-between;align-items:center">'
             +'<span style="font-weight:600;font-size:12px;color:#ddd;overflow:hidden;text-overflow:ellipsis">'+a.name+'</span>'
@@ -1877,10 +1882,11 @@ function renderNetHealth(snap){
             +'<div style="font-size:11px;color:#666;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+a.task+'">'+a.task+'</div>'
             +'<div style="font-size:10px;color:#444;margin-top:4px;display:flex;gap:8px">'
             +'<span>'+rt+'</span>'
-            +(a.cpu_pct!=null?'<span>'+a.cpu_pct+'% CPU</span>':'')
-            +(a.ram_mb!=null?'<span>'+Math.round(a.ram_mb)+'MB</span>':'')
-            +(a.progress>0?'<span style="margin-left:auto">'+a.progress+'%</span>':'')
-            +'</div>'
+             +(a.cpu_pct!=null?'<span>'+a.cpu_pct+'% CPU</span>':'')
+             +(a.ram_mb!=null?'<span>'+Math.round(a.ram_mb)+'MB</span>':'')
+             +(a.progress>0?'<span style="margin-left:auto">'+a.progress+'%</span>':'')
+             +kill
+             +'</div>'
             +bar+note+res
             +'</div>';
         }).join('');
@@ -1895,6 +1901,14 @@ function renderNetHealth(snap){
 
       async function resumeGuard() {
         await fetch('/api/fleet/guard/resume', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({note:'operator resume'})});
+        fetchStatus();
+      }
+
+      async function killFleetAgent(encodedName, displayName) {
+        if (!confirm(`Kill fleet agent ${displayName}?`)) return;
+        const response = await fetch('/api/fleet/'+encodedName+'/kill', {method:'POST'});
+        const result = await response.json();
+        if (!response.ok || !result.ok) alert(`Unable to kill ${displayName}`);
         fetchStatus();
       }
 
@@ -2814,14 +2828,6 @@ function sendChat(){
   });
 }
 
-// Show model label in chat header once status loads
-function _setChatModelLabel(snap){
-  const lbl = document.getElementById('chat-model-label');
-  if(lbl && snap && snap.system) {
-    fetch('/api/status').then(()=>{}).catch(()=>{});
-  }
-}
-
 // ── Polling ──────────────────────────────────────────────────────────────────
 function fetchStatus(){
   fetch('/api/status').then(r=>r.json()).then(render).catch(e=>console.error(e));
@@ -2843,6 +2849,25 @@ function suppressIssue(id){
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({until_minutes:60})
   }).then(r=>r.json()).then(()=>fetchStatus()).catch(e=>console.error(e));
+}
+
+// ── System review / export ───────────────────────────────────────────────────
+function runSystemReview(){
+  openModal('Fresh System Review');
+  addLine('Collecting a fresh snapshot and reviewing active issues...\n');
+  fetch('/api/review?with_ai=false')
+    .then(r=>r.json())
+    .then(d=>{
+      clearTerm();
+      addLine(`Health score: ${d.health_score}/100\n`);
+      addLine(`Active issues: ${(d.issues||[]).length}\n`);
+      (d.issues||[]).forEach(i=>addLine(`[${i.severity||'info'}] ${i.title||i.id}\n`));
+      if(!(d.issues||[]).length) addLine('No active issues detected.\n','t-done');
+    })
+    .catch(e=>addLine('ERROR: '+e+'\n','t-fail'));
+}
+function exportSystemState(){
+  window.location.assign('/api/export');
 }
 
 // ── Kill PID ─────────────────────────────────────────────────────────────────
