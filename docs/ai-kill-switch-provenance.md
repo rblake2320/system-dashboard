@@ -1,7 +1,9 @@
 # AI Fleet Auto-Halt Provenance Record
 
-Record created: **2026-07-24 14:34:08 CDT (UTC−05:00; America/Chicago)**  
-Repository: `rblake2320/system-dashboard`  
+Record created: **2026-07-24 14:34:08 CDT (UTC−05:00; America/Chicago)**
+
+Repository: `rblake2320/system-dashboard`
+
 Historical implementation commit: `6c98b1e4df5a71b9e4e3dfe2a3cdff18f94eb19f`
 
 ## Verified chronology
