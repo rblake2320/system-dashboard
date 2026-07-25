@@ -46,3 +46,17 @@ plane rather than an accidental side effect of monitoring.
 - Add inference throttling, user/account suspension, capability restriction,
   service shutdown, fallback, notification, and shutdown-verification adapters.
 - Exercise browser behavior in CI in addition to static wiring tests.
+
+## 2026-07-25 canonical snapshot correction
+
+Status, Review, and Export previously assembled different data, allowing a
+successful export to omit fleet guard, governance, keys, mesh, and daemon state
+and to disagree with Review's health score. They now consume the versioned
+`core.system_snapshot` contract.
+
+Every canonical snapshot has a UUID, UTC generation time, schema and score
+versions, application commit SHA, required-section validation, explicit
+component availability, score-input hash, and evidence SHA-256. Review retains
+the exact snapshot for the next Export, and the top bar exposes an Evidence
+Complete/Partial/Invalid indicator. Regression tests cover required sections,
+failure visibility, and cross-endpoint agreement.

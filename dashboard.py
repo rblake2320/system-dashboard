@@ -54,6 +54,7 @@ from core import bpc_ownership as _bpc_owners
 from core import bpc_secret_vault as _bpc_vault
 from core import governance_profile as _gov_profile
 from core import server_health as _svc_health
+from core import system_snapshot as _snapshots
 from core.tokens import create_token, list_tokens, validate_token, revoke_token, delete_token, SCOPES as TOKEN_SCOPES
 from daemon.monitor import daemon, alert_history
 from agents.ollama import get_agent
@@ -121,34 +122,9 @@ def index():
 
 @app.route("/api/status")
 def api_status():
-    snap = daemon.latest()
-    if not snap:
-        snap = collector.build_snapshot()
-        detected = issue_mod.detect_issues(snap)
-        issue_mod.registry.update(detected)
-        snap["issues"] = [i.as_dict() for i in issue_mod.registry.get_active()]
-        snap["alert_history"] = alert_history.get(50)
-        snap["disk_io"] = {}
-        # Load sparkline history from DB when in-memory rolling is empty
-        snap["history"] = {}
-        for metric in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
-            rows = db.get_metric_history(metric, limit=60)
-            if rows:
-                rows.reverse()  # oldest first for sparklines
-                snap["history"][metric] = [r["value"] for r in rows]
-    elif not snap.get("history"):
-        # Daemon is live but history dict is somehow empty — fill from DB
-        snap["history"] = {}
-        for metric in ("cpu_pct", "ram_pct", "gpu0_pct", "gpu0_mem_pct"):
-            rows = db.get_metric_history(metric, limit=60)
-            if rows:
-                rows.reverse()
-                snap["history"][metric] = [r["value"] for r in rows]
-    snap["daemon_alive"] = not daemon.is_stale
-    snap["last_tick_ts"] = daemon._last_tick_ts
-    snap["fleet"] = _fleet.get_fleet()
-    snap["fleet_guard"] = _guard.get_guard_state()
-    return jsonify(snap)
+    return jsonify(_snapshots.build_system_snapshot(
+        freshness="cached", reason="status"
+    ))
 
 
 @app.route("/api/issues")
@@ -849,15 +825,12 @@ def _build_filtered_context(snap: dict, issue: "issue_mod.Issue") -> dict:
 
 
 def _compute_health_score(issues: list) -> int:
-    """100 minus 20 per critical, 5 per warning."""
-    score = 100
-    for iss in issues:
-        sev = iss.get("severity") if isinstance(iss, dict) else getattr(iss, "severity", "")
-        if sev == "critical":
-            score -= 20
-        elif sev == "warning":
-            score -= 5
-    return max(0, score)
+    """Compatibility wrapper around the canonical scorer."""
+    normalized = [
+        issue if isinstance(issue, dict) else issue.as_dict()
+        for issue in issues
+    ]
+    return _snapshots.compute_health_score(normalized)
 
 
 @app.route("/api/review")
@@ -865,10 +838,8 @@ def api_review():
     """Full system review — fresh snapshot + AI diagnoses on every active issue."""
     with_ai = request.args.get("with_ai", "true").lower() not in ("false", "0", "no")
 
-    # 1. Force fresh snapshot (bypass daemon cache)
-    snap = collector.build_snapshot()
-    detected = issue_mod.detect_issues(snap)
-    issue_mod.registry.update(detected)
+    # One canonical fresh snapshot is retained so Export downloads this exact state.
+    snap = _snapshots.build_system_snapshot(freshness="fresh", reason="review")
 
     sys = snap.get("system", {})
     gpus = sys.get("gpus", [])
@@ -890,14 +861,17 @@ def api_review():
     }
 
     # 2. Build issues list — optionally run AI diagnoses
-    active_issues = issue_mod.registry.get_active()
     agent = get_agent() if with_ai else None
     issues_out = []
-    for iss in active_issues:
-        iss_dict = iss.as_dict()
+    for raw_issue in snap["issues"]:
+        iss_dict = dict(raw_issue)
         if with_ai and agent and agent.available():
             try:
-                context = _build_filtered_context(snap, iss)
+                issue_obj = issue_mod.Issue(**{
+                    key: value for key, value in iss_dict.items()
+                    if key in issue_mod.Issue.__dataclass_fields__
+                })
+                context = _build_filtered_context(snap, issue_obj)
                 result = agent.diagnose(iss_dict, context)
                 iss_dict["diagnosis"] = {
                     "summary": result.summary,
@@ -934,28 +908,39 @@ def api_review():
         "issues": issues_out,
         "top_processes_by_memory": top_by_mem,
         "top_processes_by_cpu": top_by_cpu,
-        "health_score": _compute_health_score(issues_out),
+        "health_score": snap["health_score"],
+        "snapshot_id": snap["snapshot_id"],
+        "evidence_integrity": snap["evidence_integrity"],
     })
 
 
 @app.route("/api/export")
 def api_export():
-    """Download a JSON bundle of the current system state and issue history."""
-    snap = daemon.latest() or collector.build_snapshot()
-    active_issues = issue_mod.registry.get_active()
-    issues_list = [i.as_dict() for i in active_issues]
+    """Download the exact most-recent canonical snapshot as an evidence bundle."""
+    snap = _snapshots.latest_system_snapshot(reason="export")
+    integrity = _snapshots.validate_snapshot(snap)
+    if not integrity["schema_valid"]:
+        return jsonify({
+            "error": "canonical snapshot failed schema validation",
+            "integrity": integrity,
+        }), 503
 
     bundle = {
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
-        "dashboard_version": "2.0.0",
+        "generated_at": snap["generated_at"],
+        "dashboard_version": snap["dashboard_version"],
+        "schema_version": snap["schema_version"],
+        "snapshot_id": snap["snapshot_id"],
+        "app_commit": snap["app_commit"],
+        "evidence_hash": snap["evidence_hash"],
+        "evidence_integrity": integrity,
         "system": snap,
-        "issues": issues_list,
-        "alert_history": alert_history.get(50),
-        "health_score": _compute_health_score(issues_list),
+        "issues": snap["issues"],
+        "alert_history": snap["alert_history"],
+        "health_score": snap["health_score"],
     }
 
-    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    filename = f"system-review-{date_str}.json"
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    filename = f"system-review-{timestamp}_{snap['snapshot_id'][:8]}.json"
 
     return Response(
         json.dumps(bundle, indent=2, default=str),
@@ -1276,6 +1261,8 @@ svg.spark{width:100%;height:36px;display:block;margin-top:8px}
   <div class="meta">
     <span class="dot-live" id="live-dot"></span>
     <div class="stale-banner" id="stale-banner">STALE — daemon stopped</div>
+    <span id="evidence-integrity" title="Canonical snapshot contract status"
+      style="font-size:10px;font-weight:700;padding:3px 8px;border-radius:4px;background:#222;color:#888">EVIDENCE CHECKING</span>
     <span id="ts">Loading...</span>
     <span>|</span>
     <span>Refresh in <span id="countdown">10</span>s</span>
@@ -1994,6 +1981,19 @@ function renderHooks(snap){
 function render(snap){
   document.getElementById('ts').textContent=snap.ts_display||'';
   const alive=snap.daemon_alive!==false;
+  const integrity=snap.evidence_integrity||{status:'invalid'};
+  const integrityEl=document.getElementById('evidence-integrity');
+  const integrityStyle={
+    complete:['EVIDENCE COMPLETE','#12351f','#22c55e'],
+    partial:['EVIDENCE PARTIAL','#3b2b08','#eab308'],
+    invalid:['EVIDENCE INVALID','#3b1010','#ef4444']
+  }[integrity.status]||['EVIDENCE UNKNOWN','#222','#888'];
+  integrityEl.textContent=integrityStyle[0];
+  integrityEl.style.background=integrityStyle[1];
+  integrityEl.style.color=integrityStyle[2];
+  integrityEl.title=`Snapshot ${snap.snapshot_id||'unknown'} · ${integrity.status||'unknown'}`
+    +(integrity.unavailable_components&&integrity.unavailable_components.length
+      ?` · unavailable: ${integrity.unavailable_components.join(', ')}`:'');
   document.getElementById('live-dot').style.display=alive?'':' none';
   document.getElementById('stale-banner').style.display=alive?'none':'';
   document.getElementById('live-dot').className=alive?'dot-live':'dot-stale';

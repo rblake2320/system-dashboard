@@ -62,3 +62,5 @@ def test_previously_dormant_controls_are_exposed():
     assert "exportSystemState()" in TEXT
     assert "killFleetAgent(" in TEXT
     assert "_setChatModelLabel" not in TEXT
+    assert 'id="evidence-integrity"' in TEXT
+    assert "EVIDENCE INVALID" in TEXT
